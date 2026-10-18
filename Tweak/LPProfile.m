@@ -408,6 +408,11 @@ static UIImage *LPImageNamed(NSString *name) {
 
 #pragma mark - Hook vào menu profile của Locket
 
+static BOOL LPIsProfileMenu(id vc) {
+    NSString *cls = NSStringFromClass([vc class]);
+    return [cls containsString:@"ProfileMenuV2"] || [cls containsString:@"ProfileMenu"];
+}
+
 static void LPViewDidAppear(id self, SEL _cmd, BOOL animated) {
     IMP o = LPOrigIMPFor(self, _cmd);
     if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
