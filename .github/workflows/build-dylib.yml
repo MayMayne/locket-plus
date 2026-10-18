@@ -64,7 +64,19 @@ jobs:
           PY
 
       - name: Verify
-        run: file build/LocketPlus.dylib
+        run: file build/LocketPlus.dylib && ls -l build/LocketPlus.dylib
+
+      - name: Publish release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="dylib-${{ github.run_id }}"
+          gh release create "$TAG" build/LocketPlus.dylib \
+            --repo MayMayne/locket-plus \
+            --title "LocketPlus.dylib" \
+            --notes "arm64, build ${{ github.run_id }}"
+          echo "RELEASE_OK"
 
       - uses: actions/upload-artifact@v4
         with:
