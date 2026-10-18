@@ -67,12 +67,13 @@ void LPApplyConfiguredPatches(void);
 static void LPBoot(void) {
     if (gBooted) return;
     gBooted = YES;
+    LPInstallCrashHandler();
     @try { LPInstallMediaHooks(); } @catch (NSException *e) { LPLog(@"[boot] media lỗi: %@", e); }
     @try { LPInstallFriendTools(); } @catch (NSException *e) { LPLog(@"[boot] friend lỗi: %@", e); }
     @try { LPApplyConfiguredPatches(); } @catch (NSException *e) { LPLog(@"[boot] patch lỗi: %@", e); }
     @try { LPInstallProfileUI(); } @catch (NSException *e) { LPLog(@"[boot] profile lỗi: %@", e); }
     @try { LPInstallFab(); } @catch (NSException *e) { LPLog(@"[boot] fab lỗi: %@", e); }
-    LPLog(@"[boot] Locket+ v1.1 sẵn sàng");
+    LPLog(@"[boot] Locket+ v1.2 sẵn sàng");
 }
 
 __attribute__((constructor))
