@@ -23,6 +23,7 @@
 double LPVideoSeconds(void);
 double LPVideoBytes(void);
 
+void LPInstallCrashHandler(void);
 void LPInstallMediaHooks(void);
 void LPInstallFriendTools(void);
 void LPInstallProfileUI(void);
