@@ -40,7 +40,21 @@ jobs:
             "message": "build log " + datetime.datetime.utcnow().isoformat(),
             "content": __import__("base64").b64encode(("# build\n\n```\n" + log + "\n```\n").encode()).decode(),
             "branch": "main",
-          }).encode()
+          })
+          # lấy sha hiện tại để ghi đè
+          import urllib.error
+          get = urllib.request.Request(
+            "https://api.github.com/repos/MayMayne/locket-plus/contents/BUILD_LOG.md?ref=main",
+            headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                     "Accept": "application/vnd.github+json", "User-Agent": "gha"})
+          try:
+            cur = json.loads(urllib.request.urlopen(get, timeout=60).read())
+            body = json.loads(body)
+            body["sha"] = cur["sha"]
+            body = json.dumps(body)
+          except urllib.error.HTTPError:
+            pass
+          body = body.encode()
           req = urllib.request.Request(
             "https://api.github.com/repos/MayMayne/locket-plus/contents/BUILD_LOG.md",
             data=body, method="PUT",
