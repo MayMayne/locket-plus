@@ -1,0 +1,32 @@
+name: Build LocketPlus.dylib
+
+on:
+  push:
+    branches: [main]
+    paths: ['Tweak/**', 'build.sh', '.github/workflows/**']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode
+        run: xcodebuild -version && xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Build dylib (arm64)
+        run: |
+          chmod +x build.sh
+          ./build.sh build
+
+      - name: Verify
+        run: |
+          file build/LocketPlus.dylib
+          xcrun --sdk iphoneos nm -gU build/LocketPlus.dylib | head -30 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocketPlus.dylib
+          path: build/LocketPlus.dylib
+          if-no-files-found: error
