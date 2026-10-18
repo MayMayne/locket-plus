@@ -16,14 +16,38 @@ jobs:
         run: xcodebuild -version && xcrun --sdk iphoneos --show-sdk-path
 
       - name: Build dylib (arm64)
+        id: build
         run: |
+          set +e
           chmod +x build.sh
-          ./build.sh build
+          ./build.sh build > /tmp/lp_build.log 2>&1
+          echo "exit=$?" >> /tmp/lp_build.log
+          cat /tmp/lp_build.log
+
+      - name: Publish build log
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 - << 'PY'
+          import os, json, urllib.request, datetime
+          log = open("/tmp/lp_build.log", errors="replace").read()[-60000:]
+          ok = "exit=0" in log and "error:" not in log.lower().split("exit=")[0]
+          body = json.dumps({
+            "message": "build log " + datetime.datetime.utcnow().isoformat(),
+            "content": __import__("base64").b64encode(("# build\n\n```\n" + log + "\n```\n").encode()).decode(),
+            "branch": "main",
+          }).encode()
+          req = urllib.request.Request(
+            "https://api.github.com/repos/MayMayne/locket-plus/contents/BUILD_LOG.md",
+            data=body, method="PUT",
+            headers={"Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                     "Accept": "application/vnd.github+json", "User-Agent": "gha"})
+          print(urllib.request.urlopen(req, timeout=60).status)
+          PY
 
       - name: Verify
-        run: |
-          file build/LocketPlus.dylib
-          xcrun --sdk iphoneos nm -gU build/LocketPlus.dylib | head -30 || true
+        run: file build/LocketPlus.dylib
 
       - uses: actions/upload-artifact@v4
         with:
