@@ -63,8 +63,11 @@ jobs:
           print(urllib.request.urlopen(req, timeout=60).status)
           PY
 
-      - name: Verify
-        run: file build/LocketPlus.dylib && ls -l build/LocketPlus.dylib
+      - name: Verify and sign
+        run: |
+          file build/LocketPlus.dylib && ls -l build/LocketPlus.dylib
+          codesign -s - -f build/LocketPlus.dylib
+          codesign -dv build/LocketPlus.dylib 2>&1 | head -5
 
       - name: Publish release
         if: success()
