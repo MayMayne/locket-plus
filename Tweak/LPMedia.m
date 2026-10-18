@@ -127,21 +127,12 @@ void LPInstallMediaHooks(void) {
     if (gVideoHooksInstalled) return;
     gVideoHooksInstalled = YES;
 
+    // Chỉ hook đúng 2 hàm đặt trần quay phim. Không đụng NSURLSession,
+    // AVAsset, NSFileManager hay NSURL — hook nhầm hàm hệ thống gọi hàng
+    // nghìn lần/giây là nguyên nhân làm app chết ngay khi mở.
     Class out = NSClassFromString(@"AVCaptureMovieFileOutput");
     LPHook(out, @selector(setMaxRecordedDuration:), (IMP)LPMovieMaxDurationSet);
     LPHook(out, @selector(setMaxRecordedFileSize:), (IMP)LPMovieMaxSizeSet);
-
-    LPHook(NSClassFromString(@"UIImagePickerController"), @selector(setVideoMaximumDuration:),
-           (IMP)LPPickerMaxDurSet);
-    LPHook(NSClassFromString(@"AVAssetExportSession"), @selector(setTimeRange:), (IMP)LPExportTimeRangeSet);
-
-    // CỐ Ý không hook AVAsset.duration, NSFileManager.attributesOfItemAtPath:error:
-    // và NSURL.getResourceValue:forKey:error: — ba hàm này bị gọi hàng nghìn lần/giây
-    // bởi chính hệ thống, hook sai làm app chết ngay khi mở.
-
-    Class sess = NSClassFromString(@"NSURLSession");
-    LPHook(sess, @selector(uploadTaskWithRequest:fromData:completionHandler:), (IMP)LPUploadData);
-    LPHook(sess, @selector(uploadTaskWithRequest:fromFile:completionHandler:), (IMP)LPUploadFile);
 
     LPLog(@"[media] cấu hình %.0fs / %.0fMB", LPVideoSeconds(), LPVideoBytes() / 1048576.0);
 }
