@@ -93,7 +93,7 @@ static void LPReplay(NSURLRequest *original, NSInteger attempt, NSString *idToke
     LPAddFriendLog([NSString stringWithFormat:@"[replay %ld] %@ %@", (long)attempt, req.HTTPMethod, req.URL.path]);
     [[[NSURLSession sharedSession] dataTaskWithRequest:req
         completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-            LPAddFriendLog([NSString stringWithFormat:@"[replay %ld] -> HTTP %ld body=%@ err=%@",
+            LPAddFriendLog([NSString stringWithFormat:@"[replay] -> HTTP %ld body=%@ err=%@",
                             (long)[(NSHTTPURLResponse *)resp statusCode], LPTrunc(data, 700),
                             err.localizedDescription ?: @"-"]);
         }] resume];
