@@ -194,15 +194,9 @@ void LPInstallFriendTools(void) {
     if (gFriendHooks) return;
     gFriendHooks = YES;
 
-    Class sess = NSClassFromString(@"NSURLSession");
-    SEL s1 = @selector(dataTaskWithRequest:completionHandler:);
-    Method m1 = class_getInstanceMethod(sess, s1);
-    if (m1) { LPSetOrigIMP(sess, s1, method_getImplementation(m1)); method_setImplementation(m1, (IMP)LPDataTaskHook); LPLog(@"[friend] hook dataTask"); }
-
-    SEL s2 = @selector(uploadTaskWithRequest:fromData:completionHandler:);
-    Method m2 = class_getInstanceMethod(sess, s2);
-    if (m2) { LPSetOrigIMP(sess, s2, method_getImplementation(m2)); method_setImplementation(m2, (IMP)LPUploadTaskHook); LPLog(@"[friend] hook uploadTask"); }
-
+    // KHÔNG hook NSURLSession: Locket và Firebase gọi nó liên tục, hook sai
+    // chữ ký block làm app chết. Chỉ hook GTMSessionFetcher — đúng lớp mà
+    // Firebase Functions dùng cho sendFriendRequest/acceptFriendRequest.
     Class fetcher = NSClassFromString(@"GTMSessionFetcher");
     if (fetcher) {
         SEL s3 = NSSelectorFromString(@"startWithCompletionHandler:");
