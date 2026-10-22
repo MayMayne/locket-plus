@@ -40,6 +40,7 @@
 #import <string.h>
 #import <unistd.h>
 #import <fcntl.h>
+#import <sys/stat.h>
 
 #pragma mark - fishhook
 
