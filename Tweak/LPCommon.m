@@ -195,6 +195,7 @@ void LPShowText(UIViewController *host, NSString *title, NSString *text) {
     m.songArtist = d[@"songArtist"] ?: @"";
     m.lyrics = d[@"lyrics"] ?: @"";
     m.coverName = d[@"coverName"] ?: @"";
+    m.coverVideoName = d[@"coverVideoName"] ?: @"";
     m.avatarName = d[@"avatarName"] ?: @"";
     m.featured = [NSMutableArray arrayWithArray:d[@"featured"] ?: @[]];
     m.bestFriends = [NSMutableArray array];
@@ -210,6 +211,7 @@ void LPShowText(UIViewController *host, NSString *title, NSString *text) {
         @"songArtist": self.songArtist ?: @"",
         @"lyrics": self.lyrics ?: @"",
         @"coverName": self.coverName ?: @"",
+        @"coverVideoName": self.coverVideoName ?: @"",
         @"avatarName": self.avatarName ?: @"",
         @"featured": self.featured ?: @[],
         @"bestFriends": self.bestFriends ?: @[]

@@ -117,6 +117,7 @@ static void LPBoot(void) {
     }
 
     @try { LPInstallMediaHooks(); } @catch (NSException *e) { LPLog(@"[boot] media lỗi: %@", e); }
+    @try { LPInstallExportHooks(); } @catch (NSException *e) { LPLog(@"[boot] export lỗi: %@", e); }
     @try { LPInstallGoldUnlock(); } @catch (NSException *e) { LPLog(@"[boot] gold lỗi: %@", e); }
     @try { LPInstallFriendTools(); } @catch (NSException *e) { LPLog(@"[boot] friend lỗi: %@", e); }
     @try { LPApplyConfiguredPatches(); } @catch (NSException *e) { LPLog(@"[boot] patch lỗi: %@", e); }

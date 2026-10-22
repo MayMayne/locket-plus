@@ -190,6 +190,26 @@ void LPShowHub(UIViewController *host) {
             LPShowText(vc, @"Gold", o);
         });
         add(@"🔍 Chẩn đoán kết bạn", ^{ LPRunFriendProbe(vc); });
+        add(@"✍️ Ghi chú genz", ^{ LPNotesShowPicker(); });
+        add(@"🎞 Đổi tỉ lệ video", ^{
+            UIAlertController *r = [UIAlertController alertControllerWithTitle:@"Chọn tỉ lệ"
+                                                                      message:@"Áp dụng khi xuất video"
+                                                               preferredStyle:UIAlertControllerStyleActionSheet];
+            NSArray *ratios = @[@"original", @"9:16", @"6:19", @"16:9", @"19:6", @"1:1"];
+            for (NSString *rt in ratios) {
+                [r addAction:[UIAlertAction actionWithTitle:rt style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
+                    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:[LPConfig path:@"config.plist"]] mutableCopy]
+                                             ?: [NSMutableDictionary dictionary];
+                    d[@"videoRatio"] = rt;
+                    [d writeToFile:[LPConfig path:@"config.plist"] atomically:YES];
+                    [[LPConfig shared] reload];
+                    LPShowAlert(@"Locket+", [NSString stringWithFormat:@"Tỉ lệ video: %@", rt]);
+                }]];
+            }
+            [r addAction:[UIAlertAction actionWithTitle:@"Huỷ" style:UIAlertActionStyleCancel handler:nil]];
+            if (r.popoverPresentationController) r.popoverPresentationController.sourceView = vc.view;
+            [vc presentViewController:r animated:YES completion:nil];
+        });
         add(@"🧭 Runtime Explorer", ^{ LPOpenExplorer(vc); });
         add(@"📄 Xem log", ^{ LPShowText(nil, @"Locket+ log", [LPConfig logText]); });
         add(@"💥 Crash gần nhất", ^{

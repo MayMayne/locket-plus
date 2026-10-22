@@ -31,6 +31,18 @@ void LPInstallProfileButton(UIViewController *vc);
 void LPInstallExplorer(void);
 void LPInstallGoldUnlock(void);
 void LPInstallSideloadFixes(void);
+
+// LPExport.m — xuất video theo tỉ lệ khung
+NSURL *LPExportVideoWithRatio(NSURL *srcURL, NSString *ratio, NSError **outErr);
+void LPInstallExportHooks(void);
+
+// LPNotes.m — ghi chú genz
+NSArray<NSString *> *LPNotesPresets(void);
+NSString *LPNotesRandom(void);
+NSArray<NSString *> *LPNotesUserNotes(void);
+void LPNotesAdd(NSString *note);
+void LPNotesRemove(NSString *note);
+void LPNotesShowPicker(void);
 void LPApplyConfiguredPatches(void);
 void LPReapplyPatches(void);
 
@@ -61,6 +73,7 @@ void LPWhenClassReady(NSString *className, void (^block)(Class cls));
 @property (nonatomic, copy) NSString *songArtist;
 @property (nonatomic, copy) NSString *lyrics;
 @property (nonatomic, copy) NSString *coverName;   // tên file trong thư mục dữ liệu
+@property (nonatomic, copy) NSString *coverVideoName; // nếu có, video này phủ lên ảnh bìa
 @property (nonatomic, copy) NSString *avatarName;
 @property (nonatomic, strong) NSMutableArray<NSString *> *featured;   // tên file
 @property (nonatomic, strong) NSMutableArray<NSMutableDictionary *> *bestFriends; // name/note/image

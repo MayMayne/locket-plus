@@ -1,6 +1,7 @@
 #import "LPCommon.h"
 #import <PhotosUI/PhotosUI.h>
 #import <AVFoundation/AVFoundation.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <objc/runtime.h>
 
 #pragma mark - Tiện ích ảnh
@@ -62,7 +63,9 @@ static UIImage *LPImageNamed(NSString *name) {
 @property (nonatomic, strong) UIImageView *coverView, *avatarView;
 @property (nonatomic, strong) UILabel *nameLabel, *quoteLabel, *songLabel, *lyricsLabel, *badgeLabel;
 @property (nonatomic, strong) UIStackView *featuredStack, *friendsStack;
-@property (nonatomic, copy) NSString *pickerTarget;   // cover / avatar / featured
+@property (nonatomic, copy) NSString *pickerTarget;   // cover / avatar / featured / coverVideo
+@property (nonatomic, strong) AVPlayer *coverPlayer;
+@property (nonatomic, strong) AVPlayerLayer *coverLayer;
 @end
 
 @implementation LPProfileViewController
@@ -84,7 +87,8 @@ static UIImage *LPImageNamed(NSString *name) {
     self.coverView.clipsToBounds = YES;
     self.coverView.backgroundColor = [UIColor secondarySystemBackgroundColor];
     self.coverView.userInteractionEnabled = YES;
-    [self.coverView addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(editCover)]];
+    // Giữ 1 recognizer cho cả ảnh và video; menu sẽ hỏi ảnh hay video.
+    [self.coverView addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(coverTapped)]];
     [self.scroll addSubview:self.coverView];
 
     // Avatar
@@ -195,6 +199,7 @@ static UIImage *LPImageNamed(NSString *name) {
     CGFloat W = self.view.bounds.size.width;
     self.model = [LPProfileModel load];
 
+    [self refreshCoverVideo];
     self.coverView.image = LPImageNamed(self.model.coverName) ?: [[UIImage alloc] init];
     self.coverView.backgroundColor = self.model.coverName.length ? nil : [UIColor secondarySystemBackgroundColor];
     self.avatarView.image = LPImageNamed(self.model.avatarName);
@@ -344,6 +349,91 @@ static UIImage *LPImageNamed(NSString *name) {
     [self presentViewController:p animated:YES completion:nil];
 }
 
+- (void)coverTapped {
+    UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Ảnh bìa"
+                                                             message:self.model.coverVideoName.length ? @"Đang dùng video" : nil
+                                                      preferredStyle:UIAlertControllerStyleActionSheet];
+    [a addAction:[UIAlertAction actionWithTitle:@"🖼 Chọn ảnh" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
+        [self pickImageFor:@"cover"];
+    }]];
+    [a addAction:[UIAlertAction actionWithTitle:@"🎬 Chọn video (tối đa 15s)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
+        [self pickVideoForCover];
+    }]];
+    if (self.model.coverVideoName.length) {
+        [a addAction:[UIAlertAction actionWithTitle:@"Xoá video, chỉ dùng ảnh" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *_) {
+            [[NSFileManager defaultManager] removeItemAtPath:[LPConfig path:self.model.coverVideoName] error:nil];
+            self.model.coverVideoName = @"";
+            [self.model save];
+            [self reload];
+        }]];
+    }
+    [a addAction:[UIAlertAction actionWithTitle:@"Huỷ" style:UIAlertActionStyleCancel handler:nil]];
+    if (a.popoverPresentationController) {
+        a.popoverPresentationController.sourceView = self.coverView;
+        a.popoverPresentationController.sourceRect = self.coverView.bounds;
+    }
+    [self presentViewController:a animated:YES completion:nil];
+}
+
+// Video bìa: giới hạn 15s để file nhỏ, phát lặp im lặng phía sau ảnh bìa.
+- (void)pickVideoForCover {
+    self.pickerTarget = @"coverVideo";
+    PHPickerConfiguration *cfg = [[PHPickerConfiguration alloc] init];
+    cfg.filter = [PHPickerFilter videosFilter];
+    cfg.selectionLimit = 1;
+    cfg.preferredAssetRepresentationMode = PHPickerConfigurationAssetRepresentationModeCurrent;
+    PHPickerViewController *p = [[PHPickerViewController alloc] initWithConfiguration:cfg];
+    p.delegate = self;
+    [self presentViewController:p animated:YES completion:nil];
+}
+
+- (void)refreshCoverVideo {
+    [self.coverPlayer pause];
+    [self.coverLayer removeFromSuperlayer];
+    self.coverPlayer = nil;
+    self.coverLayer = nil;
+    if (!self.model.coverVideoName.length) return;
+
+    NSURL *u = [NSURL fileURLWithPath:[LPConfig path:self.model.coverVideoName]];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:u.path]) return;
+
+    AVPlayerItem *item = [AVPlayerItem playerItemWithURL:u];
+    self.coverPlayer = [AVPlayer playerWithPlayerItem:item];
+    self.coverPlayer.muted = YES;                       // bìa không được phát tiếng
+    self.coverPlayer.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+
+    self.coverLayer = [AVPlayerLayer playerLayerWithPlayer:self.coverPlayer];
+    self.coverLayer.frame = self.coverView.bounds;
+    self.coverLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
+    [self.coverView.layer addSublayer:self.coverLayer];
+
+    // Lặp vô hạn: AVPlayer không có loop sẵn, phải tự seek về 0 khi hết.
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(coverVideoEnded:)
+                                                 name:AVPlayerItemDidPlayToEndTimeNotification
+                                               object:item];
+    [self.coverPlayer play];
+}
+
+- (void)coverVideoEnded:(NSNotification *)n {
+    [self.coverPlayer seekToTime:kCMTimeZero];
+    [self.coverPlayer play];
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    self.coverLayer.frame = self.coverView.bounds;
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    [self.coverPlayer pause];
+}
+
+- (void)dealloc {
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+}
+
 - (void)editCover { [self pickImageFor:@"cover"]; }
 - (void)editAvatar { [self pickImageFor:@"avatar"]; }
 - (void)addFeatured { [self pickImageFor:@"featured"]; }
@@ -353,6 +443,33 @@ static UIImage *LPImageNamed(NSString *name) {
     if (!results.count) return;
     NSItemProvider *prov = results.firstObject.itemProvider;
     NSString *target = self.pickerTarget;
+
+    // Video bìa: copy file .mov/.mp4 vào thư mục dữ liệu, không decode vào RAM.
+    if ([target isEqualToString:@"coverVideo"]) {
+        if (![prov hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) return;
+        [prov loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier
+                                    completionHandler:^(NSURL *url, NSError *err) {
+            if (!url || err) { LPLog(@"[profile] video bìa lỗi: %@", err); return; }
+            NSString *name = [NSString stringWithFormat:@"covervideo_%.0f.mp4",
+                              [NSDate date].timeIntervalSince1970 * 1000];
+            NSString *dst = [LPConfig path:name];
+            NSError *cpErr = nil;
+            [[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
+            if (![[NSFileManager defaultManager] copyItemAtURL:url toURL:[NSURL fileURLWithPath:dst] error:&cpErr]) {
+                LPLog(@"[profile] copy video lỗi: %@", cpErr);
+                return;
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSString *old = self.model.coverVideoName;
+                self.model.coverVideoName = name;
+                [self.model save];
+                if (old.length) [[NSFileManager defaultManager] removeItemAtPath:[LPConfig path:old] error:nil];
+                [self reload];
+            });
+        }];
+        return;
+    }
+
     [prov loadObjectOfClass:[UIImage class] completionHandler:^(UIImage *img, NSError *err) {
         if (!img) return;
         dispatch_async(dispatch_get_main_queue(), ^{
