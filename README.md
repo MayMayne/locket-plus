@@ -1,181 +1,169 @@
-# LocketPlus (`LocketPlus.dylib`) v2.0
+# Locket+ v5.3
 
-Một dylib duy nhất cho **Locket 2.68+**, viết lại từ đầu sau khi disassemble 3 dylib mẫu
-(`blatantsPatch`, `AutoRcSideload`, `MHVideoPipeline`).
+Một dylib duy nhất thay cho 4 dylib mẫu, viết lại từ đầu sau khi disassemble
+từng lệnh assembly của chúng.
 
-## Ba việc nó làm
+**Tải:** [LocketPlus.dylib](https://github.com/MayMayne/locket-plus/releases/latest)
 
-| Việc | Cách làm | Có thật sự được không |
+---
+
+## Làm được gì
+
+| Tính năng | Mặc định | Config |
 |---|---|---|
-| **Sống sót sideload** (không màn đen, không hỏng đăng nhập) | Canary keychain → đọc access group THẬT → fishhook `SecItem*` để THAY group (không xoá) + swizzle `containerURLForSecurityApplicationGroupIdentifier:` | ✅ Chắc chắn — đây đúng là cách `blatantsPatch` làm |
-| **Quay 10 phút / 500MB** | `AVCaptureMovieFileOutput.setMaxRecordedDuration/FileSize` → 600s / 500MB; `AVAssetExportSession.setFileLengthLimit` → 500MB. Thêm chế độ `compressForUpload` (theo đúng chiến lược `MHVideoPipeline`) để nén vừa giới hạn upload | ✅ Quay/chọn được. Upload vẫn phải qua Storage rules của Locket |
-| **Mở khoá Gold** | Rewrite JSON response của `api.revenuecat.com/v1/subscribers/*` (thêm entitlement + subscription còn hạn) → SDK tự parse ra CustomerInfo có Gold; + nhân bản entitlement key; + `activeSubscriptions` | ⚠️ **Client-side.** UI/gate của app mở. Badge trên máy người khác KHÔNG hiện (server không biết) |
-| **Kết bạn** | Chẩn đoán: bắt request `sendFriendRequest`/`acceptFriendRequest`, log HTTP status + body; 401 → refresh ID token + App Check rồi replay 1 lần; mở hạn mức bạn bè qua Remote Config | ⚠️ 401 cứu được. **403 (App Check) thì không** — xem dưới |
+| Quay video tối đa **10 phút / 500 MB** | ✅ | `maxRecordSeconds`, `maxRecordBytes` |
+| Chế độ quay nhanh **60 giây** | tắt | `quickMode` |
+| **Micro** khi quay (thêm input + giữ audio session) | ✅ | `addMicInput`, `keepAudioSession` |
+| Up từ thư viện tối đa **60 giây / 15 MB** | ✅ | `maxUploadSeconds`, `maxUploadBytes` |
+| **Tỉ lệ khung** 9:16 · 16:9 · 1:1 (đệm nền, không cắt hình) | `auto` | `frameRatioDefault` |
+| **Gold** phía client | ✅ | `goldEnabled` |
+| Sống sót khi sideload (không mất đăng nhập) | ✅ | `sideloadFix` |
 
-## Sự thật về kết bạn (đã kiểm chứng nhiều lần)
+Tỉ lệ **6:19 / 19:6** là cách gọi khác của **9:16 / 16:9** — đặt
+`frameRatioDefault` = `"9:16"` hoặc `"16:9"`.
 
-`sendFriendRequest` / `acceptFriendRequest` là Cloud Functions (project `locket-4252a`).
-Server kiểm `X-Firebase-AppCheck`. Bản ký lại bằng chứng chỉ khác **không tạo được
-attestation hợp lệ** cho team `SWD4AZY4KG`. Refresh token không tạo ra attestation.
+---
 
-- **401** (token cũ/hỏng do keychain đứt khi sideload) → refresh + replay **cứu được**.
-- **403** (App Check từ chối) → **không cứu được ở client**.
-- **Hạn mức bạn bè** (`max_friends_count`, `friend_limit_mode`...) là gate **client** đọc
-  từ Remote Config → dylib mở được. Nếu bạn bị chặn vì "You already have N friends"
-  thì sẽ hết chặn.
+## Cài
 
-Đường còn lại cho 403: cài bằng **TrollStore / jailbreak giữ chữ ký gốc**, hoặc để người
-dùng bản App Store gốc bấm accept link mời.
-
-## Cấu hình
-
-`Documents/LocketPlus/config.plist` (tự tạo lần đầu chạy):
-
-| Key | Mặc định | Ý nghĩa |
-|---|---|---|
-| `maxVideoSeconds` | 600 | Trần thời lượng quay |
-| `maxVideoBytes` | 524288000 | Trần dung lượng (500MB) |
-| `goldUnlock` | true | Bật/tắt mở Gold |
-| `friendLimitUnlock` | true | Mở hạn mức bạn bè (Remote Config) |
-| `friendDiagnostics` | true | Ghi `friend.log` |
-| `autoRefreshOnAuthFail` | true | 401 → refresh + replay |
-| `keepMicOnRecord` | true | Giữ audio session để video có tiếng |
-| `addMicInput` | true | Thêm micro vào AVCaptureSession nếu thiếu |
-| `expandExportRange` | **false** | Nới `AVAssetExportSession.timeRange` (phá trim của user — chỉ bật nếu biết mình làm gì) |
-| `compressForUpload` | **false** | Theo chiến lược `MHVideoPipeline`: hạ preset + ép `fileLengthLimit` về `uploadTargetBytes` |
-| `uploadTargetBytes` | 6291456 (6MB) | Đích dung lượng khi nén |
-| `exportMultiPass` | **false** | `setCanPerformMultiplePassesOverSourceMediaData` (mẫu để NO) |
-| `safeMode` | false | Tắt toàn bộ hook (cứu hộ) |
-
-## Chẩn đoán
-
-`Documents/LocketPlus/`:
-- `log.txt` — log chung (tự xoá khi > 512KB)
-- `friend.log` — kết quả chẩn đoán kết bạn
-- `boot.trace` — các bước boot (nếu app chết giữa chừng, đọc file này)
-- `crash.txt` — crash gần nhất + bước cuối
-- `crash.count` — số lần chết liên tiếp; >= 2 → tự bật `safeMode`
-
-## Build
-
-GitHub Actions (`.github/workflows/build-dylib.yml`) — mỗi push lên `main` build và
-release `LocketPlus.dylib` arm64 đã ký ad-hoc.
-
-Hoặc trên máy Mac có Xcode: `./build.sh` → `build/LocketPlus.dylib`.
-
-## Nhúng vào IPA
+### Cách 1 — tiêm vào IPA có sẵn (khuyến nghị)
 
 ```sh
 cp LocketPlus.dylib Payload/Locket.app/Frameworks/
-python3 tools/inject.py Payload/Locket.app LocketPlus.dylib   # cần: pip install lief
-# hoặc: optool install -c load -p "@executable_path/Frameworks/LocketPlus.dylib" -t Payload/Locket.app/Locket
+python3 tools/insert_dylib.py Payload/Locket.app/Locket \
+        "@executable_path/Frameworks/LocketPlus.dylib"
+ldid -S Payload/Locket.app/Locket
 ```
 
-Xoá `blatantsPatch.dylib`, `AutoRcSideload.dylib` cũ nếu có — chúng hook trùng.
+Hoặc dùng script có sẵn:
 
-## Những gì đã bị bỏ so với v1.x (và vì sao)
+```sh
+./tools/inject.sh Locket.ipa LocketPlus.ipa LocketPlus.dylib
+```
 
-| Bỏ | Lý do |
+`insert_dylib.py` ghi load command vào **vùng đệm của header**, không dịch
+chuyển byte nào. Chèn byte vào đầu `__TEXT` sẽ làm mọi `fileoff` lệch → app
+chết ngay khi mở. Đây là lỗi phổ biến của các script tiêm tự viết.
+
+### Cách 2 — thay thế 4 dylib mẫu
+
+Xoá `blatantsPatch.dylib`, `AutoRcSideload.dylib`, `MHVideoPipeline.dylib`,
+`MHProfileVideo.dylib` khỏi `Frameworks/` rồi tiêm `LocketPlus.dylib` như trên.
+
+> **Đừng chạy song song.** `LocketPlus` đã làm đủ 3 việc của 3 dylib đầu.
+> Chạy cùng nhau là hook trùng → hành vi không xác định.
+
+---
+
+## Cấu hình
+
+File `config.plist` đặt ở một trong hai chỗ:
+
+1. `<container>/Documents/LocketPlus/config.plist` — sửa được lúc chạy
+2. `Locket.app/LocketPlus.plist` — đóng gói sẵn trong IPA
+
+Lần chạy đầu, nếu không có file nào, dylib tự ghi bản mặc định vào (1).
+
+```xml
+<dict>
+    <!-- trần QUAY: 10 phút / 500MB -->
+    <key>maxRecordSeconds</key>     <real>600</real>
+    <key>maxRecordBytes</key>       <real>524288000</real>
+
+    <!-- quay nhanh 60s: bật bằng quickMode, hoặc tạo file quick.on -->
+    <key>quickMode</key>            <false/>
+    <key>quickRecordSeconds</key>   <real>60</real>
+
+    <!-- trần UP từ thư viện -->
+    <key>maxUploadSeconds</key>     <real>60</real>
+    <key>maxUploadBytes</key>       <real>15728640</real>
+
+    <!-- tỉ lệ khung: auto | 9:16 | 16:9 | 1:1 | ask -->
+    <key>frameRatioDefault</key>    <string>auto</string>
+    <key>frameBackground</key>      <string>000000</string>
+
+    <key>goldEnabled</key>          <true/>
+    <key>addMicInput</key>          <true/>
+    <key>logVerbose</key>           <true/>
+</dict>
+```
+
+`frameRatioDefault = "ask"` → hỏi bằng action sheet mỗi lần export (timeout
+20 giây thì tự chạy `auto`, không treo).
+
+---
+
+## Log & chẩn đoán
+
+`<container>/Documents/LocketPlus/`
+
+| File | Nội dung |
 |---|---|
-| `LPProfile.m` (Profile+ UI) | Dựng lại cây view profile của app → `unrecognized selector` khi Locket đổi layout. Đây là nguồn crash lớn nhất |
-| `LPNotes.m` (ghi chú genz) | 456 dòng UI, không liên quan 3 mục tiêu |
-| `LPExplorer.m` / `LPPatch.m` | Hook class theo tên đoán → im lặng hoặc crash |
-| `LPExport.m` | Trùng hook với `LPMedia` → đệ quy |
-| Hook `RCEntitlementInfos.all/.active` trả NSDictionary | Value thật là **object** `RCEntitlementInfo`, không phải dict → `unrecognized selector` → crash ngay khi mở app (lỗi v1.4–v1.11) |
-| `MSHookFunction` cho `SecItem*` | Vá mã máy trong dyld shared cache → iOS 15+ giết process trong constructor (lỗi v1.12) |
-| `CFDictionaryRemoveValue(query, kSecAttrAccessGroup)` | Xoá group → Firebase Auth mất phiên → màn đen + quay mãi ở login (lỗi v1.12/v1.13) |
-| Hook `-[AVAsset duration]`, `-[NSFileManager attributesOfItemAtPath:]` | Getter trả struct / chạy hàng nghìn lần → crash hoặc làm hỏng đọc file |
+| `log.txt` | từng bước hook, giới hạn đã áp, response RevenueCat đã vá |
+| `crash.txt` | signal + backtrace thật (POSIX, không dùng Foundation) |
+| `crash.count` | số lần chết liên tiếp |
 
+**Safe mode:** chết 2 lần liên tiếp → tự bật, chỉ ghi log, không hook gì.
+Boot sạch 2 lần trong safe mode → tự tắt. Bật tay: `safeMode = true`.
+Không bao giờ bật chỉ vì bạn vuốt tắt app (đếm theo kích thước `crash.txt`,
+không đếm số lần mở app).
 
-## Đính chính: tôi đã đọc sai `MHVideoPipeline` (sửa ngày 22/10)
+---
 
-Bản README trước ghi 4 điều **sai** về dylib mẫu. Sau khi đọc lại từng lệnh assembly:
+## Đã bám dylib mẫu ở đâu
 
-| Tôi ghi sai | Sự thật (kèm địa chỉ) |
-|---|---|
-| Preset ladder `HighestQuality → 1920x1080 → 1280x720 → Medium` | Ladder **hạ cấp**, thứ tự thật: **1280x720 trước**, rồi 1920x1080, không có cả hai thì giữ preset gốc (`0x8558`, `0x8590`, `0x85c0`) |
-| `setFileLengthLimit` → 500MB | `0x600000` = **6 MB** (`0x8de0`) |
-| `setCanPerformMultiplePassesOverSourceMediaData` → YES | **NO** (`0x8e78`) |
-| Hằng `0x17c88` = "600 giây" | Đó là **timescale của `kCMTimeZero`** (`value=0, timescale=600, flags=1`), dùng cho `setTransform:atTime:` trong `_FitComposition` — không liên quan thời lượng |
-| (ngầm hiểu) dylib này nâng trần quay | **Không hề hook `setMaxRecordedDuration`/`FileSize`**. Nó chỉ hook `-[AVAssetExportSession initWithAsset:presetName:]` (`_ExportInit` @ `0x8420`) |
+| Dylib mẫu | Kỹ thuật lấy được | Ghi chú |
+|---|---|---|
+| `blatantsPatch` | canary keychain → đọc access group thật → fishhook `SecItem*` **thay** group (không xoá) → swizzle `containerURL` + `_initWithSuiteName:container:` | Bản mẫu quét `__got`; ta quét thêm `__la_symbol_ptr`/`__nl_symbol_ptr` và **bỏ qua `__auth_got`** (con trỏ PAC) |
+| `AutoRcSideload` | rewrite JSON RevenueCat ở tầng `NSURLSession` completion handler | Chỉ 1 class, 2 selector — đúng như binary mẫu |
+| `MHVideoPipeline` | preset ladder 720p→1080p, `fileLengthLimit`, `AVMutableVideoComposition` đệm khung | Mẫu **nén** chứ không nâng trần; ta làm cả hai, tách bằng config |
+| `MHProfileVideo` | không gộp | video bìa profile, không nằm trong yêu cầu |
 
-**Kết luận đúng:** `MHVideoPipeline` là tweak **nén video cho vừa giới hạn upload**, không phải tweak nâng giới hạn. Đó mới là cách video dài thực sự upload được — vì server Locket kiểm dung lượng ở Storage rules.
+### 3 chỗ bản mẫu làm sai/thiếu, đã sửa
 
-Vì vậy `LocketPlus` giờ làm **cả hai**, tách bằng config: mặc định nâng trần (600s/500MB) như bạn yêu cầu; bật `compressForUpload` thì chuyển sang chiến lược nén của dylib mẫu.
+1. **`_Configure` set `fileLengthLimit` = 6 MB cho MỌI export.** Video 10 phút
+   sẽ fail. Ta dùng ngân sách theo độ dài: ≤60s → 15 MB, dài hơn → 500 MB.
+2. **`setCanPerformMultiplePassesOverSourceMediaData: NO`** — đúng cho máy yếu,
+   nhưng làm giảm chất lượng khi nén mạnh. Ta để mặc định NO như mẫu.
+3. **Không đụng `setTimeRange`** — đúng. Ta cũng không đụng, trừ khi bật
+   `trimToUpload` (mặc định tắt), vì nới/cắt timeRange là phá thao tác trim
+   của người dùng.
 
-Bài học: đừng suy ra hành vi từ tên hằng số. `600` trong một `CMTime` là **timescale**, không phải số giây.
+---
 
+## Giới hạn thật (đọc kỹ)
 
-## v2.1 — sửa 5 lỗi thật gây crash (đọc từ log thật)
+- **Gold là client-side.** Server Locket vẫn coi tài khoản là free:
+  - Badge Gold trên profile **người khác xem** không hiện (server ghi đè).
+  - Hạn mức kết bạn phía server **không đổi**.
+  - Giao dịch thật vẫn qua App Store.
+- **Trần 500 MB / 10 phút** là trần *ghi hình trên máy*. Server Locket có
+  Storage rules riêng; nếu upload bị từ chối vì dung lượng, bật
+  `compressShortUploads` (mặc định bật) hoặc giảm `maxRecordBytes`.
+- **Kết bạn** không nằm trong bản này. Nó bị chặn ở App Check / Cloud
+  Functions phía server, không sửa được từ client.
 
-Log của bạn cho thấy 3 sự thật quan trọng:
+---
 
-```
-[net] hook 10 method trên 6 class     <- hook quá rộng
-crash.txt rỗng (không stack trace)    <- handler chết trong handler
-[23:21:18] [boot] sẵn sàng            <- boot XONG rồi mới chết
-[23:21:21] (chết)                     <- ~3s sau, không đều
-```
+## Build
 
-### 1. Lỗi gốc: `LPHookMethod` sửa Method của CLASS CHA
-
-Đây là lỗi nghiêm trọng nhất, và nó giải thích tại sao 4 dylib mẫu chạy được còn của tôi thì không.
-
-```objc
-// SAI (bản cũ của tôi)
-Method m = class_getInstanceMethod(cls, sel);   // ĐI LÊN class cha nếu cls không tự cài
-method_setImplementation(m, newImp);            // sửa Method của CHA
-// => MỌI subclass đều chạy qua code của tôi
-```
-
-```objc
-// ĐÚNG (cả 2 dylib mẫu đều làm thế)
-// _Hook @0x8364 (MHVideoPipeline), _ObserveMethod @0x4570 (blatantsPatch)
-duyệt class_copyMethodList để biết class nào SỞ HỮU method:
-  owner == cls  -> method_setImplementation
-  owner != cls  -> class_addMethod lên cls   (class cha KHÔNG bị đụng)
+```sh
+./build.sh            # cần Xcode + SDK iOS
 ```
 
-Với `NSURLSession` (class cluster), bản cũ của tôi còn quét **6 class** và hook **10 method** — gồm cả class private của hệ thống. Mỗi response trong app đều chạy qua code tweak. `AutoRcSideload` hook **đúng 1 class, 2 selector**.
+CI: GitHub Actions trên `macos-26`, đẩy tag `dylib-<run_id>` kèm artifact.
 
-### 2. Crash handler không ghi được gì
+## Cấu trúc
 
-Handler cũ dùng `NSMutableString` + `writeToFile:` — Foundation trong signal handler có thể chết (heap hỏng, lock bị giữ) → `crash.txt` chỉ còn template. Giờ dùng `open`/`read`/`write`/`snprintf` thuần POSIX.
-
-### 3. `__got` KHÔNG phải con trỏ PAC
-
-Bản cũ bỏ qua cả `__got` trên arm64e với lý do "con trỏ PAC" → sideload fix không đầy đủ. Sự thật: chỉ **`__auth_got`** là con trỏ đã ký PAC. `blatantsPatch` vá `__got` và chạy được.
-
-### 4. Bỏ 2 thứ tôi tự bịa (không dylib mẫu nào làm)
-
-| Bỏ | Vì sao |
-|---|---|
-| `LPRemoteConfig` | Hook `boolValue`/`numberValue`/`integerValue`/`stringValue` của **mọi** lần đọc Remote Config trong app. Không mẫu nào làm. Bề mặt crash cực lớn |
-| Hook `RCEntitlementInfos` / `RCCustomerInfo` | `AutoRcSideload` chỉ rewrite JSON, không hook class. Value của `.all`/`.active` là object thật; nhân bản dưới nhiều key có thể làm SDK so sánh `identifier != key` |
-
-### 5. `NSUserDefaults`: hook đúng selector private
-
-`blatantsPatch` hook **`_initWithSuiteName:container:`**, không phải `initWithSuiteName:`. Và nó **thay container** bằng thư mục thật — không trả `standardUserDefaults` (làm vậy là trộn dữ liệu app với app-group, và trả object khác class caller mong đợi).
-
-### 6. Không dùng KVC
-
-`MHProfileSupport._FetcherFinished` (@0xd4f0) kiểm `respondsToSelector:` **trước mọi lệnh gửi**. Bản cũ của tôi dùng `[fetcher valueForKey:@"request"]` → `NSUnknownKeyException` chờ xảy ra.
-
-## Nếu vẫn crash
-
-Giờ có thêm công cụ để khoanh vùng. Trong `Documents/LocketPlus/`:
-
-- **`live.trace`** — ghi từng bước hook chạy (net.completion, media.maxDuration…). Crash xảy ra sau boot thì file này cho biết đang ở đâu.
-- **`crash.txt`** — giờ có stack trace thật (địa chỉ).
-- **`boot.trace`** — bước boot cuối.
-
-Và tắt từng module trong `config.plist` để khoanh vùng:
-
-| Key | Tắt gì |
-|---|---|
-| `mediaEnabled` | Toàn bộ hook video |
-| `goldUnlock` | Gold + xoá cache |
-| `friendDiagnostics` | Chẩn đoán kết bạn + GTMSessionFetcher observer |
-| `safeMode` | Tất cả |
-
-Cách nhanh nhất: bật `safeMode` (chắc chắn mở được app), rồi bật lại **một** module mỗi lần.
+```
+Tweak/
+  LPCommon.h/.m    config, log thread-safe, hook an toàn, tầng mạng
+  LPCrash.m        crash handler POSIX + safe mode
+  LPSideload.m     fishhook SecItem* + app group + NSUserDefaults suite
+  LPGold.m         rewrite JSON RevenueCat
+  LPMedia.m        trần quay, mic, tỉ lệ khung, preset ladder
+  LPEntry.m        thứ tự khởi động
+tools/
+  insert_dylib.py  tiêm load command vào vùng đệm (an toàn)
+  inject.sh        tiêm + ký + đóng gói IPA
+```
