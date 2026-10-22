@@ -11,7 +11,7 @@ Tweak/LPFriend.m:76:45: note: used here
 ==> build/LocketPlus.dylib
 Non-fat file: build/LocketPlus.dylib is architecture: arm64
 Executable=/Users/runner/work/locket-plus/locket-plus/build/LocketPlus.dylib
-Identifier=LocketPlus-555549444868f5eedd79371a818b1af99e4017e4
+Identifier=LocketPlus-555549446f7ba076ec1739aa992cfd4e3ed1dfc8
 Format=Mach-O thin (arm64)
 exit=0
 
