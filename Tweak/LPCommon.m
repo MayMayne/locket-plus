@@ -125,13 +125,15 @@ void LPWhenClassReady(NSString *className, void (^block)(Class cls)) {
     // muộn hơn dylib, nhưng không được chờ vô hạn.
     __block int tries = 0;
     __block void (^retry)(void);
+    __weak void (^weakRetry)(void) = nil;   // tránh retain cycle của block tự tham chiếu
     retry = ^{
         Class cls = NSClassFromString(className);
         if (cls) { block(cls); return; }
         if (++tries > 40) { LPLog(@"[hook] không thấy class %@", className); return; }
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), retry);
+                       dispatch_get_main_queue(), weakRetry);
     };
+    weakRetry = retry;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), retry);
 }
