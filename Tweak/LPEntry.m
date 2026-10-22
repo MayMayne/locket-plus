@@ -1,16 +1,15 @@
 // ============================================================================
 //  LPEntry.m — khởi động
 //
-//  Thứ tự BẮT BUỘC (rút ra từ các lần crash trước):
-//    1. Crash handler — nếu không, crash trong constructor không được ghi lại
-//    2. Sideload fixes — app đụng app-group + keychain ngay màn hình đầu tiên
-//    3. Chờ app launch xong (0.6s) rồi mới cài hook của app
+//  Thứ tự bắt buộc:
+//    1. Crash handler  (nếu không, crash trong constructor không được ghi)
+//    2. Sideload fixes (app đụng app-group + keychain ngay màn hình đầu)
+//    3. Chờ app launch xong 0.6s rồi mới hook
 //
 //  KHÔNG đụng UIKit trong constructor: dylib nạp trước khi UIApplication tồn tại.
 // ============================================================================
 
 #import "LPCommon.h"
-#import <objc/runtime.h>
 
 void LPBootStep(const char *name);
 
@@ -21,62 +20,29 @@ static void LPBoot(void) {
     gBooted = YES;
 
     if ([[LPConfig shared] flag:@"safeMode" fallback:NO]) {
-        LPLog(@"[boot] SAFE MODE — không cài hook nào. Sửa safeMode=false trong config.plist.");
+        LPLog(@"[boot] SAFE MODE — không cài hook. Sửa safeMode=false trong config.plist.");
+        LPMarkBootOK();
         return;
     }
 
-    // Trace của lượt trước không còn giá trị — xoá để lần này đọc được đúng.
-    [[NSFileManager defaultManager] removeItemAtPath:LPPath(@"live.trace") error:nil];
-
-    LPBootStep("net");
-    @try { LPInstallNetHooks(); }
-    @catch (NSException *e) { LPLog(@"[boot] net: %@", e.reason); }
-
-    if ([[LPConfig shared] flag:@"mediaEnabled" fallback:YES]) {
-        LPBootStep("media");
-        @try { LPInstallMediaHooks(); }
-        @catch (NSException *e) { LPLog(@"[boot] media: %@", e.reason); }
-    }
-
-    if ([[LPConfig shared] flag:@"goldUnlock" fallback:YES]) {
-        LPBootStep("gold");
-        @try { LPInvalidateRevenueCatCacheOnce(); LPInstallGoldNetProcessor(); }
-        @catch (NSException *e) { LPLog(@"[boot] gold: %@", e.reason); }
-    }
-
-    if ([[LPConfig shared] flag:@"friendDiagnostics" fallback:YES]) {
-        LPBootStep("friend");
-        @try { LPInstallFriendTools(); }
-        @catch (NSException *e) { LPLog(@"[boot] friend: %@", e.reason); }
-    }
-
-    // Probe chạy ngầm, ghi file, không hiện UI.
-    if ([[LPConfig shared] flag:@"friendDiagnostics" fallback:YES]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            @try { LPRunFriendProbe(); } @catch (__unused NSException *e) {}
-        });
-    }
+    LPBootStep("media");
+    @try { LPInstallMediaHooks(); }
+    @catch (NSException *e) { LPLog(@"[boot] media: %@", e.reason); }
 
     LPBootStep("done");
+    LPLog(@"[boot] Locket+ v3.0 sẵn sàng — %.0fs / %.0fMB",
+          LPVideoSeconds(), LPVideoBytes() / 1048576.0);
 
-    // 8s sau mà app còn sống → boot thành công.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ LPMarkBootOK(); });
-
-    LPLog(@"[boot] Locket+ v2.0 sẵn sàng");
 }
 
 __attribute__((constructor))
 static void LPInit(void) {
     @autoreleasepool {
-        // 1) Bắt crash TRƯỚC TIÊN.
         @try { LPInstallCrashHandler(); } @catch (__unused NSException *e) {}
-
-        // 2) Sideload fixes phải chạy TRƯỚC main().
         @try { LPInstallSideloadFixes(); } @catch (__unused NSException *e) {}
 
-        // 3) Chờ app launch xong rồi mới hook app.
         [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationDidFinishLaunchingNotification
                         object:nil queue:[NSOperationQueue mainQueue]
