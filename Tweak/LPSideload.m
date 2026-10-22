@@ -1,88 +1,117 @@
 // ============================================================================
 //  LPSideload.m — sống sót khi cài sideload
 //
-//  BÀI HỌC TỪ LOG THẬT:
-//   • v1.11 dùng MSHookFunction để vá SecItem* → chết ngay trong constructor.
-//   • v1.12 bỏ hết vá keychain → app mở được nhưng MÀN ĐEN + quay mãi ở màn
-//     đăng nhập, vì Firebase Auth ghi/đọc phiên trong keychain với
-//     kSecAttrAccessGroup của team gốc. Bản ký lại không có group đó →
-//     errSecMissingEntitlement → không khôi phục được phiên.
+//  Viết lại theo ĐÚNG những gì blatantsPatch.dylib làm (đã disassemble):
 //
-//  Cách của blatantsPatch.dylib (bản KHÔNG crash, đăng nhập được):
-//   • Tự vá mã máy bằng vm_protect + memcpy (KHÔNG dùng MSHookFunction).
-//   • Bỏ kSecAttrAccessGroup khỏi mọi query SecItem*.
-//   • Swizzle containerURLForSecurityApplicationGroupIdentifier: trả thư mục thật.
+//  1. Hook bằng FISHHOOK, không phải MSHookFunction và không phải vm_protect.
+//     Fishhook sửa __la_symbol_ptr trong __LINKEDIT — không đụng mã máy của
+//     hàm hệ thống, nên không bao giờ chết trong constructor.
+//     (MSHookFunction vá mã máy trong dyld shared cache → crash ngay.)
 //
-//  Ở đây làm đúng như vậy, tự viết trampoline để không phụ thuộc substrate.
+//  2. KHÔNG xoá kSecAttrAccessGroup. Đọc access group THẬT của app hiện tại
+//     rồi THAY vào query. Xoá đi thì Firebase Auth không tìm thấy item cũ
+//     → màn đen + quay mãi ở màn đăng nhập.
+//
+//  3. Swizzle containerURLForSecurityApplicationGroupIdentifier: (ObjC).
 // ============================================================================
 
 #import "LPCommon.h"
 #import <objc/runtime.h>
 #import <Security/Security.h>
-#import <mach/mach.h>
-#import <sys/mman.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 #import <string.h>
-#import <libkern/OSCacheControl.h>
 
 static NSString *const kLPAppGroupID = @"group.com.locket.Locket-Shared";
 
-#pragma mark - inline hook (trampoline, không cần substrate)
+#pragma mark - fishhook (tự viết, không cần thư viện ngoài)
 
-// Vá 16 byte đầu hàm bằng: ldr x16,#8 ; br x16 ; .quad <đích>
-// Bản gốc được copy sang một trang executable riêng + nhảy về target+16,
-// nhờ vậy vẫn gọi được hàm gốc (khác MSHookFunction, cái này không crash).
-static int LPInlineHook(void *target, void *replacement, void **origOut) {
-    if (!target || !replacement) return 0;
+// Cấu trúc một lần rebind: tên symbol + con trỏ thay thế + nơi lưu bản gốc.
+typedef struct {
+    const char *name;
+    void       *replacement;
+    void      **original;
+} LPRebind;
 
-    const int patchLen = 16;
-    size_t pageSize = 16384;
+// Sửa mọi con trỏ lazy/non-lazy binding trỏ tới `name` trong image đang nạp.
+static void LPRebindImage(const struct mach_header_64 *mh, intptr_t slide,
+                          LPRebind *items, int count) {
+    if (!mh || mh->magic != MH_MAGIC_64) return;
 
-    void *tramp = mmap(NULL, pageSize, PROT_READ | PROT_WRITE | PROT_EXEC,
-                       MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (tramp == MAP_FAILED) {
-        LPLog(@"[sideload] mmap trampoline thất bại");
-        return 0;
+    const struct segment_command_64 *linkedit = NULL;
+    const struct symtab_command *symtab = NULL;
+    const struct dysymtab_command *dysymtab = NULL;
+
+    const uint8_t *p = (const uint8_t *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strcmp(seg->segname, "__LINKEDIT") == 0) linkedit = seg;
+        } else if (lc->cmd == LC_SYMTAB) {
+            symtab = (const struct symtab_command *)lc;
+        } else if (lc->cmd == LC_DYSYMTAB) {
+            dysymtab = (const struct dysymtab_command *)lc;
+        }
+        p += lc->cmdsize;
     }
+    if (!linkedit || !symtab || !dysymtab) return;
 
-    // 1) copy prologue gốc
-    memcpy(tramp, target, patchLen);
-    // 2) nhảy về target + patchLen
-    uint32_t *p = (uint32_t *)((char *)tramp + patchLen);
-    p[0] = 0x58000050;                       // ldr x16, #8
-    p[1] = 0xD61F0200;                       // br  x16
-    *(uint64_t *)(p + 2) = (uint64_t)((char *)target + patchLen);
-    sys_icache_invalidate(tramp, pageSize);
+    const uint8_t *base = (const uint8_t *)mh;
+    const char *strtab = (const char *)(base + slide + symtab->stroff);
+    const struct nlist_64 *syms = (const struct nlist_64 *)(base + slide + symtab->symoff);
 
-    // 3) mở quyền ghi cho trang chứa target rồi vá
-    vm_address_t page = (vm_address_t)target & ~(vm_address_t)(pageSize - 1);
-    kern_return_t kr = vm_protect(mach_task_self(), page, pageSize, false,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) {
-        LPLog(@"[sideload] vm_protect lỗi %d cho %p", kr, target);
-        munmap(tramp, pageSize);
-        return 0;
+    // Quét các section chứa con trỏ binding.
+    p = (const uint8_t *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)p;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            const struct section_64 *sect = (const struct section_64 *)(seg + 1);
+            for (uint32_t s = 0; s < seg->nsects; s++, sect++) {
+                // Chỉ 2 loại section chứa con trỏ cần sửa.
+                BOOL lazy = (strcmp(sect->sectname, "__la_symbol_ptr") == 0);
+                BOOL nonlazy = (strcmp(sect->sectname, "__nl_symbol_ptr") == 0);
+                if (!lazy && !nonlazy) continue;
+
+                void **ptrs = (void **)(base + slide + sect->offset);
+                uint32_t n = sect->size / sizeof(void *);
+                const uint32_t *indirect =
+                    (const uint32_t *)(base + slide + dysymtab->indirectsymoff);
+                for (uint32_t k = 0; k < n; k++) {
+                    // reserved1 = vị trí bắt đầu của section trong bảng indirect.
+                    uint32_t symIndex = indirect[sect->reserved1 + k];
+                    if (symIndex == INDIRECT_SYMBOL_LOCAL ||
+                        symIndex == INDIRECT_SYMBOL_ABS) continue;
+                    if (symIndex >= symtab->nsyms) continue;
+
+                    const char *symName = strtab + syms[symIndex].n_un.n_strx;
+                    for (int it = 0; it < count; it++) {
+                        if (strcmp(symName, items[it].name) != 0) continue;
+                        if (items[it].original && !*items[it].original) {
+                            *items[it].original = ptrs[k];
+                        }
+                        // Chỉ ghi khi con trỏ đang trỏ tới stub gốc.
+                        ptrs[k] = items[it].replacement;
+                        break;
+                    }
+                }
+            }
+        }
+        p += lc->cmdsize;
     }
-
-    uint32_t *t = (uint32_t *)target;
-    t[0] = 0x58000050;
-    t[1] = 0xD61F0200;
-    *(uint64_t *)(t + 2) = (uint64_t)replacement;
-    sys_icache_invalidate(target, patchLen);
-
-    if (origOut) *origOut = tramp;
-    return 1;
 }
 
-#pragma mark - keychain: bỏ access group sai
-
-// Trả query đã bỏ kSecAttrAccessGroup. Caller phải CFRelease nếu khác bản gốc.
-static CFDictionaryRef LPSanitize(CFDictionaryRef query) {
-    if (!query) return query;
-    if (!CFDictionaryContainsKey(query, kSecAttrAccessGroup)) return query;
-    CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, query);
-    if (!m) return query;
-    CFDictionaryRemoveValue(m, kSecAttrAccessGroup);
-    return m;
+static void LPRebindAll(LPRebind *items, int count) {
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const struct mach_header *mh = _dyld_get_image_header(i);
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+        if (mh && mh->filetype == MH_EXECUTE) {
+            LPRebindImage((const struct mach_header_64 *)mh, slide, items, count);
+        }
+    }
 }
 
 typedef OSStatus (*LPSec2)(CFDictionaryRef, CFTypeRef *);
@@ -93,9 +122,63 @@ static LPSec2 gOrigAdd, gOrigCopy;
 static LPSecUpd gOrigUpd;
 static LPSecDel gOrigDel;
 
+#pragma mark - access group thật của app
+
+// Access group thật = "<teamID>.<bundleID>". Trên bản sideload team ID là của
+// người ký lại, nên phải đọc động chứ không hardcode.
+static NSString *LPRealAccessGroup(void) {
+    static NSString *group;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // Cách 1: entitlements của app (chính xác nhất).
+        NSBundle *b = [NSBundle mainBundle];
+        NSDictionary *ent = nil;
+        @try {
+            ent = [b objectForInfoDictionaryKey:@"entitlements"];
+        } @catch (__unused NSException *e) {}
+
+        // Cách 2: hỏi thẳng Security xem app có group nào.
+        if (!ent) {
+            NSDictionary *q = @{(__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                                (__bridge id)kSecReturnAttributes: @YES,
+                                (__bridge id)kSecMatchLimit: (__bridge id)kSecMatchLimitOne};
+            CFTypeRef res = NULL;
+            // Dùng IMP GỐC: SecItemCopyMatching đã bị hook → gọi lại là đệ quy vô hạn.
+            OSStatus st = gOrigCopy ? gOrigCopy((__bridge CFDictionaryRef)q, &res) : errSecParam;
+            if (st == errSecSuccess && res) {
+                NSDictionary *attrs = (__bridge_transfer NSDictionary *)res;
+                id g = attrs[(__bridge id)kSecAttrAccessGroup];
+                if ([g isKindOfClass:[NSString class]]) group = g;
+            }
+        }
+
+        if (!group.length) {
+            // Cách 3: dựng theo bundle id — đúng với app ký bằng cert cá nhân.
+            NSString *bid = b.bundleIdentifier ?: @"com.locket.Locket";
+            group = bid;   // không có team id thì dùng chính bundle id
+        }
+        LPLog(@"[sideload] access group thật: %@", group);
+    });
+    return group;
+}
+
+#pragma mark - SecItem* wrappers
+
+// THAY access group, không xoá. Xoá → Firebase Auth mất phiên → màn đen.
+static CFDictionaryRef LPFixQuery(CFDictionaryRef query) {
+    if (!query) return query;
+    NSString *real = LPRealAccessGroup();
+    if (!real.length) return query;
+
+    CFMutableDictionaryRef m = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, query);
+    if (!m) return query;
+    CFDictionarySetValue(m, kSecAttrAccessGroup, (__bridge CFStringRef)real);
+    return m;   // caller phải CFRelease
+}
+
 static OSStatus LPAdd(CFDictionaryRef q, CFTypeRef *res) {
     if (!gOrigAdd) return errSecParam;
-    CFDictionaryRef s = LPSanitize(q);
+    CFDictionaryRef s = LPFixQuery(q);
     OSStatus st = gOrigAdd(s, res);
     if (s != q) CFRelease(s);
     return st;
@@ -103,7 +186,7 @@ static OSStatus LPAdd(CFDictionaryRef q, CFTypeRef *res) {
 
 static OSStatus LPCopy(CFDictionaryRef q, CFTypeRef *res) {
     if (!gOrigCopy) return errSecParam;
-    CFDictionaryRef s = LPSanitize(q);
+    CFDictionaryRef s = LPFixQuery(q);
     OSStatus st = gOrigCopy(s, res);
     if (s != q) CFRelease(s);
     return st;
@@ -111,7 +194,7 @@ static OSStatus LPCopy(CFDictionaryRef q, CFTypeRef *res) {
 
 static OSStatus LPUpd(CFDictionaryRef q, CFDictionaryRef attrs) {
     if (!gOrigUpd) return errSecParam;
-    CFDictionaryRef s = LPSanitize(q);
+    CFDictionaryRef s = LPFixQuery(q);
     OSStatus st = gOrigUpd(s, attrs);
     if (s != q) CFRelease(s);
     return st;
@@ -119,16 +202,14 @@ static OSStatus LPUpd(CFDictionaryRef q, CFDictionaryRef attrs) {
 
 static OSStatus LPDel(CFDictionaryRef q) {
     if (!gOrigDel) return errSecParam;
-    CFDictionaryRef s = LPSanitize(q);
+    CFDictionaryRef s = LPFixQuery(q);
     OSStatus st = gOrigDel(s);
     if (s != q) CFRelease(s);
     return st;
 }
 
-#pragma mark - app group
+#pragma mark - app group container
 
-// Dùng đúng vị trí chuẩn mà Locket mong đợi (Library/Shared/AppGroup/<id>),
-// KHÔNG dùng thư mục tuỳ ý — sai đường dẫn là app không thấy dữ liệu cũ.
 static NSString *LPGroupPath(void) {
     NSArray *paths = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
                                                          NSUserDomainMask, YES);
@@ -144,12 +225,10 @@ static NSString *LPGroupPath(void) {
 static NSURL *(*gOrigContainerURL)(id, SEL, NSString *);
 static NSURL *LPContainerURL(id self, SEL _cmd, NSString *groupID) {
     NSURL *real = gOrigContainerURL ? gOrigContainerURL(self, _cmd, groupID) : nil;
-    if (real) return real;                    // có entitlement thật → dùng luôn
+    if (real) return real;
     if (![groupID isKindOfClass:[NSString class]]) return nil;
     if (![groupID containsString:@"locket"]) return nil;
 
-    // Hàm này bị gọi HÀNG CHỤC LẦN mỗi giây (Locket hỏi liên tục). Cache lại,
-    // nếu không sẽ vừa chậm vừa ngập log. Chỉ tạo thư mục 1 lần.
     static NSURL *cached;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -163,15 +242,17 @@ static NSURL *LPContainerURL(id self, SEL _cmd, NSString *groupID) {
 
 void LPInstallSideloadFixes(void) {
     @autoreleasepool {
-        // 1) keychain — chỉ vá khi thật sự cần (bản ký lại không có group).
-        BOOL patched = 0;
-        patched += LPInlineHook((void *)SecItemAdd, (void *)LPAdd, (void **)&gOrigAdd);
-        patched += LPInlineHook((void *)SecItemCopyMatching, (void *)LPCopy, (void **)&gOrigCopy);
-        patched += LPInlineHook((void *)SecItemUpdate, (void *)LPUpd, (void **)&gOrigUpd);
-        patched += LPInlineHook((void *)SecItemDelete, (void *)LPDel, (void **)&gOrigDel);
-        LPLog(@"[sideload] SecItem*: vá %d/4 hàm", patched);
+        // Fishhook: sửa con trỏ binding, KHÔNG vá mã máy → an toàn trong constructor.
+        static LPRebind items[] = {
+            {"_SecItemAdd",          (void *)LPAdd,  (void **)&gOrigAdd},
+            {"_SecItemCopyMatching", (void *)LPCopy, (void **)&gOrigCopy},
+            {"_SecItemUpdate",       (void *)LPUpd,  (void **)&gOrigUpd},
+            {"_SecItemDelete",       (void *)LPDel,  (void **)&gOrigDel},
+        };
+        LPRebindAll(items, 4);
+        LPLog(@"[sideload] fishhook SecItem*: add=%p copy=%p upd=%p del=%p",
+              gOrigAdd, gOrigCopy, gOrigUpd, gOrigDel);
 
-        // 2) app group container
         Class fm = NSClassFromString(@"NSFileManager");
         SEL sel = @selector(containerURLForSecurityApplicationGroupIdentifier:);
         if (LPHookMethod(fm, sel, (IMP)LPContainerURL, (IMP *)&gOrigContainerURL)) {
