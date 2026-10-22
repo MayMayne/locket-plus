@@ -415,7 +415,10 @@ static BOOL LPIsProfileMenu(id vc) {
 
 // Gắn nút ✨ vào màn profile đang hiển thị. LPEntry gọi sau viewDidAppear gốc.
 void LPInstallProfileButton(UIViewController *self) {
-    if (!self || !LPIsProfileMenu(self)) return;
+    // Hook chạy trên MỌI class có viewDidAppear: → phải kiểm tra kiểu trước khi
+    // gửi selector của UIViewController (nếu không là crash "unrecognized selector").
+    if (!self || ![self isKindOfClass:[UIViewController class]]) return;
+    if (!LPIsProfileMenu(self)) return;
     UIView *host = ((UIViewController *)self).view;
     if (!host || [host viewWithTag:0x4C50504C]) return;   // LPPL
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];

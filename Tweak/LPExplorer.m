@@ -192,6 +192,23 @@ void LPShowHub(UIViewController *host) {
         add(@"🔍 Chẩn đoán kết bạn", ^{ LPRunFriendProbe(vc); });
         add(@"🧭 Runtime Explorer", ^{ LPOpenExplorer(vc); });
         add(@"📄 Xem log", ^{ LPShowText(nil, @"Locket+ log", [LPConfig logText]); });
+        add(@"💥 Crash gần nhất", ^{
+            NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+            NSString *p = [[dir stringByAppendingPathComponent:@"LocketPlus"] stringByAppendingPathComponent:@"crash.txt"];
+            NSString *t = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
+            LPShowText(vc, @"crash.txt", t.length ? t : @"(không có crash.txt — app chưa từng crash trong tweak)");
+        });
+        add(@"🛟 Bật/tắt chế độ an toàn", ^{
+            LPConfig *c = [LPConfig shared];
+            BOOL on = [c flag:@"safeMode" fallback:NO];
+            NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:[LPConfig path:@"config.plist"]] mutableCopy]
+                                     ?: [NSMutableDictionary dictionary];
+            d[@"safeMode"] = @(!on);
+            [d writeToFile:[LPConfig path:@"config.plist"] atomically:YES];
+            [c reload];
+            LPShowAlert(@"Locket+", !on ? @"Đã BẬT chế độ an toàn.\nMở lại app để áp dụng (chỉ còn nút L+)."
+                                       : @"Đã TẮT chế độ an toàn.\nMở lại app để hook hoạt động lại.");
+        });
         add(@"⚙️ Sửa config.plist", ^{ LPShowText(nil, @"config.plist", [NSString stringWithContentsOfFile:[LPConfig path:@"config.plist"] encoding:NSUTF8StringEncoding error:nil]); });
         add(@"♻️ Nạp lại config", ^{ LPReapplyPatches();
             LPShowAlert(@"Locket+", [NSString stringWithFormat:@"Đã nạp lại.\nVideo %.0fs / %.0fMB",

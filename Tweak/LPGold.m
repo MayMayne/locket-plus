@@ -49,6 +49,8 @@ static BOOL LPKeyUnlocked(NSString *key) {
 #pragma mark - đọc key của FIRRemoteConfigValue qua ivar
 
 // KVC không đọc được ivar `_key`, nên phải lấy thẳng từ object layout.
+// AN TOÀN: chỉ đọc khi ivar thật sự có kiểu con trỏ char*; nếu class đổi layout
+// (thêm/bớt ivar) mà ta đọc mù → đọc rác rồi gửi cho UTF8String → crash.
 static const char *LPRCIvarKey(id obj) {
     if (!obj) return NULL;
     for (Class c = object_getClass(obj); c; c = class_getSuperclass(c)) {
@@ -57,10 +59,18 @@ static const char *LPRCIvarKey(id obj) {
         Ivar *ivs = class_copyIvarList(c, &n);
         for (unsigned i = 0; i < n; i++) {
             const char *name = ivar_getName(ivs[i]);
-            if (!name) continue;
+            const char *type = ivar_getTypeEncoding(ivs[i]);
+            if (!name || !type) continue;
             if (strcmp(name, "_key") == 0 || strcmp(name, "key") == 0 ||
                 strcmp(name, "_configKey") == 0) {
-                const char *v = *(const char **)((char *)(__bridge void *)obj + ivar_getOffset(ivs[i]));
+                const char *v = NULL;
+                if (strcmp(type, "*") == 0) {          // char *
+                    v = *(const char **)((char *)(__bridge void *)obj + ivar_getOffset(ivs[i]));
+                } else if (strcmp(type, "@\"NSString\"") == 0) {   // NSString *
+                    NSString *sv = (__bridge NSString *)(*(void **)((char *)(__bridge void *)obj + ivar_getOffset(ivs[i])));
+                    free(ivs);
+                    return sv.length ? sv.UTF8String : NULL;
+                }
                 free(ivs);
                 return v;
             }
@@ -71,9 +81,11 @@ static const char *LPRCIvarKey(id obj) {
 }
 
 static NSString *LPRCKeyString(id obj) {
-    const char *k = LPRCIvarKey(obj);
-    if (!k) return nil;
-    return [NSString stringWithUTF8String:k];
+    @try {
+        const char *k = LPRCIvarKey(obj);
+        if (!k) return nil;
+        return [NSString stringWithUTF8String:k];
+    } @catch (__unused NSException *e) { return nil; }
 }
 
 #pragma mark - hook FIRRemoteConfigValue

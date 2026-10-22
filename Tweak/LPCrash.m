@@ -35,7 +35,25 @@ static void LPExceptionHandler(NSException *e) {
     [s writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
+// Đánh dấu "đang chạy"; nếu lần sau mở mà cờ vẫn còn → lần trước đã chết.
+static NSString *LPSafeFlagPath(void) {
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    return [[dir stringByAppendingPathComponent:@"LocketPlus"] stringByAppendingPathComponent:@"running.flag"];
+}
+
 void LPInstallCrashHandler(void) {
+    // Nếu file cờ còn tồn tại từ lần chạy trước → app đã chết không sạch.
+    NSString *flag = LPSafeFlagPath();
+    if ([[NSFileManager defaultManager] fileExistsAtPath:flag]) {
+        NSString *cfg = [LPConfig path:@"config.plist"];
+        NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:cfg] mutableCopy] ?: [NSMutableDictionary dictionary];
+        d[@"safeMode"] = @YES;
+        [d writeToFile:cfg atomically:YES];
+        NSLog(@"[Locket+] lần chạy trước không thoát sạch → bật safeMode");
+    }
+    [[NSFileManager defaultManager] createDirectoryAtPath:[flag stringByDeletingLastPathComponent]
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    [@"1" writeToFile:flag atomically:YES encoding:NSUTF8StringEncoding error:nil];
     NSSetUncaughtExceptionHandler(&LPExceptionHandler);
     signal(SIGSEGV, LPSignalHandler);
     signal(SIGABRT, LPSignalHandler);
