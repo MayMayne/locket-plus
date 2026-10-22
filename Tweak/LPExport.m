@@ -178,6 +178,62 @@ NSURL *LPExportVideoWithRatio(NSURL *srcURL, NSString *ratio, NSError **outErr) 
     return outURL;
 }
 
+#pragma mark - re-encode cho vừa giới hạn server
+
+// Kỹ thuật lấy từ MHVideoPipeline: khi file vượt trần server, KHÔNG thể
+// "bypass" (Storage rules kiểm ở server). Cách duy nhất là hạ chất lượng
+// cho vừa. Thử lần lượt từ cao xuống thấp, dừng ở preset đầu tiên vừa.
+static NSArray<NSString *> *LPPresetLadder(void) {
+    return @[AVAssetExportPresetHighestQuality,
+             AVAssetExportPreset1920x1080,
+             AVAssetExportPreset1280x720,
+             AVAssetExportPresetMediumQuality];
+}
+
+static BOOL LPExportOnce(AVAsset *asset, NSString *preset, NSURL *outURL, NSError **err) {
+    AVAssetExportSession *ex = [[AVAssetExportSession alloc] initWithAsset:asset presetName:preset];
+    if (!ex) return NO;
+    [[NSFileManager defaultManager] removeItemAtURL:outURL error:nil];
+    ex.outputURL = outURL;
+    ex.outputFileType = AVFileTypeMPEG4;
+    ex.shouldOptimizeForNetworkUse = YES;
+    ex.canPerformMultiplePassesOverSourceMediaData = YES;
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    [ex exportAsynchronouslyWithCompletionHandler:^{ dispatch_semaphore_signal(sem); }];
+    long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(180 * NSEC_PER_SEC)));
+    if (waited != 0) { [ex cancelExport]; return NO; }
+    if (ex.status != AVAssetExportSessionStatusCompleted) { if (err) *err = ex.error; return NO; }
+    return YES;
+}
+
+// Xuất video với chất lượng thấp dần cho tới khi file <= maxBytes.
+// Trả về URL file vừa, hoặc nil nếu mọi preset đều vượt.
+NSURL *LPExportVideoToFit(NSURL *srcURL, long long maxBytes, NSError **outErr) {
+    AVURLAsset *asset = [AVURLAsset URLAssetWithURL:srcURL options:nil];
+    if (!asset) return nil;
+
+    for (NSString *preset in LPPresetLadder()) {
+        NSString *name = [NSString stringWithFormat:@"lpfit_%.0f.mp4",
+                          [NSDate date].timeIntervalSince1970 * 1000];
+        NSURL *out = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:name]];
+        NSError *e = nil;
+        if (!LPExportOnce(asset, preset, out, &e)) {
+            LPLog(@"[export] preset %@ thất bại: %@", preset, e.localizedDescription ?: @"?");
+            continue;
+        }
+        NSNumber *sz = nil;
+        [out getResourceValue:&sz forKey:NSURLFileSizeKey error:nil];
+        long long bytes = sz.longLongValue;
+        LPLog(@"[export] %@ → %.1fMB (trần %.1fMB)", preset, bytes / 1048576.0, maxBytes / 1048576.0);
+        if (maxBytes <= 0 || bytes <= maxBytes) return out;
+        [[NSFileManager defaultManager] removeItemAtURL:out error:nil];
+    }
+    if (outErr) *outErr = [NSError errorWithDomain:@"LocketPlus" code:5
+                                          userInfo:@{NSLocalizedDescriptionKey: @"mọi preset đều vượt trần"}];
+    return nil;
+}
+
 #pragma mark - hook nới giới hạn export
 
 // setFileLengthLimit: nhận long long — tham số, an toàn.

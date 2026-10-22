@@ -34,6 +34,8 @@ void LPInstallSideloadFixes(void);
 
 // LPExport.m — xuất video theo tỉ lệ khung
 NSURL *LPExportVideoWithRatio(NSURL *srcURL, NSString *ratio, NSError **outErr);
+// Hạ chất lượng cho vừa maxBytes (dùng khi server từ chối vì quá lớn).
+NSURL *LPExportVideoToFit(NSURL *srcURL, long long maxBytes, NSError **outErr);
 void LPInstallExportHooks(void);
 
 // LPNotes.m — ghi chú genz
