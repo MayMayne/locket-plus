@@ -34,6 +34,7 @@ static LPConfig *gConfig;
             @"addMicInput"          : @YES,
             @"goldUnlock"           : @YES,
             @"friendLimitUnlock"    : @YES,
+            @"expandExportRange"    : @NO,
             @"friendDiagnostics"    : @YES,
             @"autoRefreshOnAuthFail": @YES,
             @"safeMode"             : @NO,

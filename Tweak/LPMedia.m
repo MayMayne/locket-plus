@@ -50,33 +50,34 @@ static void LPMaxFileSize(id self, SEL _cmd, long long size) {
 #pragma mark - AVAssetExportSession
 
 // Locket tự cắt video trước khi upload: setTimeRange + setFileLengthLimit.
-// Nới cả hai để video 10 phút đi qua được bước export cục bộ.
 //
-// CMTimeRange là struct 48 byte → trên arm64 truyền gián tiếp qua con trỏ.
-// Khai báo ĐÚNG kiểu struct là compiler tự lo phần ABI; khai báo sai (void*)
-// là crash. Đây là lý do phải khai báo tường minh, không dùng id.
+// CẨN THẬN: setTimeRange cũng là API người dùng dùng để CẮT video (trim).
+// Tự nới range = phá ý định của người dùng (cắt 15s thành 60s).
+// Vì vậy mặc định CHỈ GHI LOG. Muốn nới thì bật "expandExportRange" = true
+// trong config.plist và tự chịu rủi ro đó.
+//
+// CMTimeRange là struct 48 byte → arm64 truyền gián tiếp qua con trỏ.
+// Khai báo ĐÚNG kiểu struct là compiler tự lo ABI; khai báo sai (void*) là crash.
 static void LPExportTimeRange(id self, SEL _cmd, CMTimeRange r) {
     IMP o = LPOrigIMPFor(self, _cmd);
     if (!o) return;
 
     CMTimeRange use = r;
     @try {
-        double limit = LPVideoSeconds();
         double d = CMTimeGetSeconds(r.duration);
-        double start = CMTimeGetSeconds(r.start);
-
-        // Chỉ nới khi: bắt đầu từ 0, bị cắt ngắn hơn trần của ta, và asset
-        // thật sự dài hơn range đó. Không đụng range của thao tác trim hợp lệ.
-        if (isfinite(d) && isfinite(start) && start <= 0.001 && d > 0 && d < limit) {
+        if (isfinite(d) && d > 0) {
+            LPLog(@"[media] export timeRange %.1fs (start %.1fs)", d, CMTimeGetSeconds(r.start));
+        }
+        if ([[LPConfig shared] flag:@"expandExportRange" fallback:NO] &&
+            isfinite(d) && d > 0 && d < LPVideoSeconds()) {
             id asset = ((id (*)(id, SEL))objc_msgSend)(self, @selector(asset));
             if (asset) {
                 CMTime ad = ((CMTime (*)(id, SEL))objc_msgSend)(asset, @selector(duration));
                 double assetSecs = CMTimeGetSeconds(ad);
                 if (isfinite(assetSecs) && assetSecs > d + 0.05) {
-                    double want = MIN(assetSecs, limit);
+                    double want = MIN(assetSecs, LPVideoSeconds());
                     use = CMTimeRangeMake(kCMTimeZero, CMTimeMakeWithSeconds(want, 600));
-                    LPLog(@"[media] export timeRange %.1fs → %.1fs (asset %.1fs)",
-                          d, want, assetSecs);
+                    LPLog(@"[media] nới timeRange %.1fs → %.1fs", d, want);
                 }
             }
         }
@@ -93,7 +94,6 @@ static void LPExportFileLengthLimit(id self, SEL _cmd, long long limit) {
     if (use != limit) LPLog(@"[media] export fileLengthLimit %lld → %lld", limit, use);
     ((void (*)(id, SEL, long long))o)(self, _cmd, use);
 }
-
 // Export video dài cần nhiều pass; không bật thì AVAssetExportSession fail
 // giữa đường với video > ~2 phút hoặc > 200MB.
 static void LPExportMultiPass(id self, SEL _cmd, BOOL v) {
