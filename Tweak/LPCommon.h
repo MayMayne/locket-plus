@@ -82,5 +82,6 @@ void LPMarkBootOK(void);
 void LPTrace(const char *what);
 
 void LPInstallSideloadFixes(void);
+void LPWatchdogStart(void);
 void LPInstallGold(void);
 void LPInstallMedia(void);

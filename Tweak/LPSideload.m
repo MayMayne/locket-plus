@@ -380,7 +380,7 @@ static id LPInitSuiteContainer(id self, SEL _cmd, NSString *suite, id container)
 // Watchdog: nếu app không tới được LPMarkBootOK trong 8 giây, ghi lại mốc cuối
 // cùng đã chạy. Lần sau đọc log là biết treo ở đâu — không phải đoán.
 // Chạy trên thread riêng, chỉ dùng POSIX.
-static void LPWatchdogStart(void) {
+void LPWatchdogStart(void) {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         for (int i = 0; i < 16; i++) {
             usleep(500 * 1000);              // 16 × 0.5s = 8s
