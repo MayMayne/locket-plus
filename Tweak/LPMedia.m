@@ -302,6 +302,13 @@ static AVMutableVideoComposition *LPFitComposition(AVAsset *asset, double ratio)
 static void LPAskRatio(void (^done)(NSString *choice)) {
     void (^finish)(NSString *) = ^(NSString *c) { if (done) done(c); };
 
+    // UIAlertController PHẢI present trên main thread. exportAsynchronously có
+    // thể được gọi từ background → dispatch, không present tại chỗ.
+    if (![NSThread isMainThread]) {
+        dispatch_async(dispatch_get_main_queue(), ^{ LPAskRatio(done); });
+        return;
+    }
+
     UIWindow *win = nil;
     @try {
         if (@available(iOS 13.0, *)) {
@@ -349,6 +356,64 @@ static void LPAskRatio(void (^done)(NSString *choice)) {
         LPLog(@"[media] alert tỉ lệ lỗi: %@", e.reason);
         finish(@"auto");
     }
+}
+
+#pragma mark - preset ladder (bám sát _ExportInit @0x8420 của mẫu)
+
+// Mẫu hook -[AVAssetExportSession initWithAsset:presetName:] và HẠ preset:
+//   1. AVAssetExportPreset1280x720   (kiểm trước — 0x8558)
+//   2. AVAssetExportPreset1920x1080  (0x8590)
+//   3. không có cả hai → giữ preset gốc (0x85c0)
+// Đó là cách video dài thực sự vừa giới hạn upload, vì fileLengthLimit chỉ là
+// gợi ý — AVFoundation có thể bỏ qua và export ra file to hơn.
+//
+// Hook họ "init" dưới ARC: PHẢI khai báo ns_returns_retained, nếu không ARC
+// chèn objc_autoreleaseReturnValue lên một object +1 → over-release → crash.
+// (Đây là lý do bản v1.x chết; không phải "không được hook init".)
+static NSArray<NSString *> *LPPresetLadder(void) {
+    id v = [[LPConfig shared] obj];
+    (void)v;
+    return @[@"AVAssetExportPreset1280x720",
+             @"AVAssetExportPreset1920x1080"];
+}
+
+static NSString *LPChoosePreset(AVAsset *asset, NSString *requested) {
+    if (![[LPConfig shared] flag:@"compressShortUploads" fallback:YES]) return requested;
+    if (!asset || ![requested isKindOfClass:[NSString class]]) return requested;
+
+    // CHỈ hạ preset cho clip NGẮN (mục tiêu 15MB / 60s ≈ 2 Mbps).
+    // Video quay dài 10 phút có ngân sách 500MB ≈ 6.7 Mbps — 1080p vẫn vừa,
+    // hạ xuống 720p chỉ làm mất chi tiết mà không cần thiết.
+    @try {
+        double d = CMTimeGetSeconds(asset.duration);
+        if (!isfinite(d) || d <= 0) return requested;
+        if (d > LPUploadSeconds() + 0.5) return requested;
+    } @catch (__unused NSException *e) { return requested; }
+
+    @try {
+        NSArray *compatible = [AVAssetExportSession exportPresetsCompatibleWithAsset:asset];
+        if (![compatible isKindOfClass:[NSArray class]] || !compatible.count) return requested;
+
+        for (NSString *p in LPPresetLadder()) {
+            if ([compatible containsObject:p]) {
+                if (![p isEqualToString:requested]) {
+                    LPLog(@"[media] preset %@ → %@ (clip ngắn, nén vừa 15MB)", requested, p);
+                }
+                return p;
+            }
+        }
+    } @catch (NSException *e) { LPLog(@"[media] chọn preset lỗi: %@", e.reason); }
+    return requested;
+}
+
+static id LPExportInit(id self, SEL _cmd, AVAsset *asset, NSString *preset)
+    __attribute__((ns_returns_retained));
+
+static id LPExportInit(id self, SEL _cmd, AVAsset *asset, NSString *preset) {
+    IMP o = LPOrigIMPFor(self, _cmd);
+    if (!o) return nil;
+    NSString *use = LPChoosePreset(asset, preset);
+    return ((id (*)(id, SEL, AVAsset *, NSString *))o)(self, _cmd, asset, use);
 }
 
 #pragma mark - AVAssetExportSession
@@ -519,13 +584,15 @@ void LPInstallMedia(void) {
     LPLog(@"[media] AVAudioSession.setActive=%d", e);
 
     Class exp = NSClassFromString(@"AVAssetExportSession");
+    BOOL f0 = LPHookMethodTyped(exp, @selector(initWithAsset:presetName:), "@",
+                                (IMP)LPExportInit, NULL);
     BOOL f = LPHookMethodTyped(exp, @selector(setTimeRange:), "v",
                                (IMP)LPExportTimeRange, NULL);
     BOOL g = LPHookMethodTyped(exp, @selector(setFileLengthLimit:), "v",
                                (IMP)LPExportFileLengthLimit, NULL);
     BOOL h = LPHookMethodTyped(exp, @selector(exportAsynchronouslyWithCompletionHandler:), "v",
                                (IMP)LPExportAsync, NULL);
-    LPLog(@"[media] AVAssetExportSession range=%d limit=%d export=%d", f, g, h);
+    LPLog(@"[media] AVAssetExportSession init=%d range=%d limit=%d export=%d", f0, f, g, h);
 
     Class picker = NSClassFromString(@"UIImagePickerController");
     BOOL i = LPHookMethodTyped(picker, @selector(setVideoMaximumDuration:), "v",

@@ -22,28 +22,43 @@ static LPConfig *gConfig;
     return gConfig;
 }
 
+// Đọc config: ưu tiên Documents (sửa được lúc chạy), fallback về bundle
+// (đặt sẵn lúc đóng gói IPA — tiện vì không cần Filza).
 - (void)reload {
     NSString *p = LPPath(@"config.plist");
-    if (![[NSFileManager defaultManager] fileExistsAtPath:p]) {
-        NSDictionary *def = @{
+    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
+
+    if (![d isKindOfClass:[NSDictionary class]]) {
+        NSString *bundled = [[NSBundle mainBundle] pathForResource:@"LocketPlus"
+                                                            ofType:@"plist"];
+        if (bundled.length) d = [NSDictionary dictionaryWithContentsOfFile:bundled];
+    }
+
+    if (![d isKindOfClass:[NSDictionary class]]) {
+        d = @{
             @"safeMode"            : @NO,
             @"goldEnabled"         : @YES,
             @"mediaEnabled"        : @YES,
             @"sideloadFix"         : @YES,
             @"maxRecordSeconds"    : @600,
             @"maxRecordBytes"      : @(500.0 * 1024 * 1024),
+            @"quickMode"           : @NO,
+            @"quickRecordSeconds"  : @60,
             @"maxUploadSeconds"    : @60,
             @"maxUploadBytes"      : @(15.0 * 1024 * 1024),
+            @"compressShortUploads": @YES,
             @"addMicInput"         : @YES,
             @"keepAudioSession"    : @YES,
             @"frameRatioEnabled"   : @YES,
             @"frameRatioDefault"   : @"auto",
+            @"frameMaxDimension"   : @1920,
+            @"frameBackground"     : @"000000",
+            @"trimToUpload"        : @NO,
             @"logVerbose"          : @YES
         };
-        [def writeToFile:p atomically:YES];
+        [d writeToFile:p atomically:YES];
     }
-    NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:p];
-    self.plist = [d isKindOfClass:[NSDictionary class]] ? d : @{};
+    self.plist = d;
 }
 
 - (BOOL)flag:(NSString *)key fallback:(BOOL)fb {
