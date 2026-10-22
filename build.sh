@@ -1,6 +1,5 @@
 #!/bin/sh
-# Build LocketPlus.dylib bằng clang của Xcode (không cần theos)
-# Dùng trên macOS / GitHub Actions runner.
+# Build LocketPlus.dylib bằng clang của Xcode (không cần theos).
 set -e
 
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -9,18 +8,18 @@ MIN=${MIN_IOS:-15.0}
 
 mkdir -p "$OUT"
 
-# Chỉ arm64. Slice arm64e trong một dylib không có chữ ký ad-hoc hợp lệ
-# làm dyld từ chối nạp trên máy không jailbreak -> app chết ngay khi mở.
+# Chỉ arm64. Slice arm64e trong dylib không ký ad-hoc hợp lệ sẽ bị dyld từ chối.
 xcrun --sdk iphoneos clang \
   -arch arm64 \
   -isysroot "$SDK" \
   -miphoneos-version-min="$MIN" \
-  -dynamiclib -fobjc-arc -fmodules \
+  -dynamiclib -fobjc-arc -fmodules -fblocks \
   -O2 -fvisibility=default \
   -Wno-deprecated-declarations \
+  -Wno-unused-function -Wno-unused-variable \
   -framework Foundation -framework UIKit -framework AVFoundation \
-  -framework PhotosUI -framework CoreMedia -framework QuartzCore \
-  -framework Security -ldl \
+  -framework AVFAudio -framework CoreMedia -framework QuartzCore \
+  -framework Security -framework CoreFoundation -ldl \
   -install_name @rpath/LocketPlus.dylib \
   Tweak/*.m \
   -o "$OUT/LocketPlus.dylib"

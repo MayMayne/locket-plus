@@ -1,69 +1,117 @@
+// ============================================================================
+//  LPMedia.m — trần quay 600s / 500MB
+//
+//  BÁM SÁT MHVideoPipeline.dylib (đã disassemble):
+//    • Hook -[AVCaptureMovieFileOutput setMaxRecordedDuration:] và
+//      setMaxRecordedFileSize: → ép về 600s / 500MB.
+//    • Hook -[AVAssetExportSession setFileLengthLimit:] / setTimeRange: →
+//      nới trần export (đây là chỗ Locket tự cắt video trước khi upload).
+//    • setCanPerformMultiplePassesOverSourceMediaData = YES → export video dài
+//      không fail giữa đường.
+//    • Preset ladder: HighestQuality → 1920x1080 → 1280x720 → Medium.
+//
+//  TUYỆT ĐỐI KHÔNG hook getter trả struct (CMTime, CMTimeRange, CGRect...).
+//  Trên arm64 struct > 16 byte trả qua con trỏ ẩn ở x8 — khai báo sai chữ ký
+//  là ghi vào thanh ghi rác → crash (đúng lỗi v1.5/v1.6).
+//  Chỉ hook SETTER nhận struct làm THAM SỐ — tham số thì truyền bình thường.
+// ============================================================================
+
 #import "LPCommon.h"
 #import <AVFoundation/AVFoundation.h>
-#import <PhotosUI/PhotosUI.h>
 #import <AVFAudio/AVFAudio.h>
 #import <objc/message.h>
-#import <objc/runtime.h>
 
-//
-// LPMedia — phá trần quay/chọn video.
-//
-// ĐÃ BỎ so với bản trước (đây là lỗi làm app chết):
-//   - hook -[AVAsset duration]  → chỉ cần đọc duration của video là nổ, và hook
-//     getter vốn KHÔNG chặn được giới hạn nào vì app đọc từ Swift property.
-//   - hook -[NSFileManager attributesOfItemAtPath:error:] → chạy hàng nghìn lần,
-//     và ghi đè NSFileSize làm Locket đọc file lỗi.
-//   - hook -[NSURLSession uploadTaskWithRequest:fromData:] → chữ ký block dễ sai,
-//     upload ảnh/video nào cũng đi qua đây.
-//
-// TUYỆT ĐỐI KHÔNG hook getter trả struct (CMTime, CMTimeRange, CGRect...):
-// arm64 trả struct >16 byte qua con trỏ ẩn ở x8, không phải tham số thứ 3.
-// Khai báo sai chữ ký = ghi vào thanh ghi rác = crash ngay.
-//
-// GIỚI HẠN THẬT CỦA LOCKET (đọc từ binary 2.68):
-//   * Quay: AVCaptureMovieFileOutput.maxRecordedDuration / maxRecordedFileSize  (client)
-//   * Chọn từ thư viện: PHPicker (KHÔNG dùng UIImagePickerController) → lọc bằng
-//     PHPickerFilter + kiểm tra duration/size sau khi load, không có setter để hook.
-//   * Upload: Storage rules + Cloud Function kiểm duration/size  (server, không phá được)
-//
+static BOOL gMediaInstalled = NO;
 
-static BOOL gMediaHooksInstalled = NO;
+#pragma mark - AVCaptureMovieFileOutput
 
-static void LPMHook(Class cls, SEL sel, IMP newImp) {
-    if (LPHookMethod(cls, sel, newImp, NULL)) {
-        LPLog(@"[media] hook %@.%@", NSStringFromClass(cls), NSStringFromSelector(sel));
-    } else {
-        LPLog(@"[media] bỏ qua %@.%@ (không có)", cls ? NSStringFromClass(cls) : @"nil", NSStringFromSelector(sel));
+static void LPMaxDuration(id self, SEL _cmd, CMTime t) {
+    double want = LPVideoSeconds();
+    double real = CMTimeGetSeconds(t);
+    if (isfinite(real) && real > 0 && real < want) {
+        LPLog(@"[media] maxRecordedDuration %.0fs → %.0fs", real, want);
     }
-}
-
-#pragma mark - AVCaptureMovieFileOutput: trần quay
-
-static void LPMovieMaxDurationSet(id self, SEL _cmd, CMTime t) {
-    double secs = CMTimeGetSeconds(t);
-    if (secs > 0 && !isnan(secs)) LPLog(@"[media] maxRecordedDuration thật = %.1fs -> ép %.0fs", secs, LPVideoSeconds());
     IMP o = LPOrigIMPFor(self, _cmd);
-    if (o) ((void (*)(id, SEL, CMTime))o)(self, _cmd, CMTimeMakeWithSeconds(LPVideoSeconds(), 600));
+    if (!o) return;
+    CMTime v = CMTimeMakeWithSeconds(want, 600);
+    ((void (*)(id, SEL, CMTime))o)(self, _cmd, v);
 }
 
-static void LPMovieMaxSizeSet(id self, SEL _cmd, long long size) {
-    LPLog(@"[media] maxRecordedFileSize thật = %lld -> ép %.0f", size, LPVideoBytes());
+static void LPMaxFileSize(id self, SEL _cmd, long long size) {
+    long long want = (long long)LPVideoBytes();
+    if (size > 0 && size < want) {
+        LPLog(@"[media] maxRecordedFileSize %lld → %lld", size, want);
+    }
     IMP o = LPOrigIMPFor(self, _cmd);
-    if (o) ((void (*)(id, SEL, long long))o)(self, _cmd, (long long)LPVideoBytes());
+    if (!o) return;
+    ((void (*)(id, SEL, long long))o)(self, _cmd, want);
 }
 
-#pragma mark - UIImagePickerController (Locket 2.68 không dùng, để dành cho bản cũ)
+#pragma mark - AVAssetExportSession
 
-static void LPPickerMaxDurSet(id self, SEL _cmd, double secs) {
-    LPLog(@"[media] videoMaximumDuration thật = %.1fs -> ép %.0fs", secs, LPVideoSeconds());
+// Locket tự cắt video trước khi upload: setTimeRange + setFileLengthLimit.
+// Nới cả hai để video 10 phút đi qua được bước export cục bộ.
+//
+// CMTimeRange là struct 48 byte → trên arm64 truyền gián tiếp qua con trỏ.
+// Khai báo ĐÚNG kiểu struct là compiler tự lo phần ABI; khai báo sai (void*)
+// là crash. Đây là lý do phải khai báo tường minh, không dùng id.
+static void LPExportTimeRange(id self, SEL _cmd, CMTimeRange r) {
     IMP o = LPOrigIMPFor(self, _cmd);
-    if (o) ((void (*)(id, SEL, double))o)(self, _cmd, LPVideoSeconds());
+    if (!o) return;
+
+    CMTimeRange use = r;
+    @try {
+        double limit = LPVideoSeconds();
+        double d = CMTimeGetSeconds(r.duration);
+        double start = CMTimeGetSeconds(r.start);
+
+        // Chỉ nới khi: bắt đầu từ 0, bị cắt ngắn hơn trần của ta, và asset
+        // thật sự dài hơn range đó. Không đụng range của thao tác trim hợp lệ.
+        if (isfinite(d) && isfinite(start) && start <= 0.001 && d > 0 && d < limit) {
+            id asset = ((id (*)(id, SEL))objc_msgSend)(self, @selector(asset));
+            if (asset) {
+                CMTime ad = ((CMTime (*)(id, SEL))objc_msgSend)(asset, @selector(duration));
+                double assetSecs = CMTimeGetSeconds(ad);
+                if (isfinite(assetSecs) && assetSecs > d + 0.05) {
+                    double want = MIN(assetSecs, limit);
+                    use = CMTimeRangeMake(kCMTimeZero, CMTimeMakeWithSeconds(want, 600));
+                    LPLog(@"[media] export timeRange %.1fs → %.1fs (asset %.1fs)",
+                          d, want, assetSecs);
+                }
+            }
+        }
+    } @catch (__unused NSException *e) {}
+
+    ((void (*)(id, SEL, CMTimeRange))o)(self, _cmd, use);
 }
 
-#pragma mark - micro: bật audio session để video có tiếng
+static void LPExportFileLengthLimit(id self, SEL _cmd, long long limit) {
+    IMP o = LPOrigIMPFor(self, _cmd);
+    if (!o) return;
+    long long want = (long long)LPVideoBytes();
+    long long use = (limit > 0 && limit < want) ? want : limit;
+    if (use != limit) LPLog(@"[media] export fileLengthLimit %lld → %lld", limit, use);
+    ((void (*)(id, SEL, long long))o)(self, _cmd, use);
+}
 
-// Locket đôi khi tắt audio session khi quay (để không ngắt nhạc đang phát).
-// Khi tắt, video xuất ra KHÔNG có tiếng. Bật lại ở chế độ PlayAndRecord.
+// Export video dài cần nhiều pass; không bật thì AVAssetExportSession fail
+// giữa đường với video > ~2 phút hoặc > 200MB.
+static void LPExportMultiPass(id self, SEL _cmd, BOOL v) {
+    IMP o = LPOrigIMPFor(self, _cmd);
+    if (!o) return;
+    ((void (*)(id, SEL, BOOL))o)(self, _cmd, YES);
+}
+
+#pragma mark - UIImagePickerController (bản Locket cũ)
+
+static void LPPickerMaxDuration(id self, SEL _cmd, double secs) {
+    IMP o = LPOrigIMPFor(self, _cmd);
+    if (!o) return;
+    ((void (*)(id, SEL, double))o)(self, _cmd, LPVideoSeconds());
+}
+
+#pragma mark - micro
+
 static void LPEnsureAudioSession(void) {
     AVAudioSession *s = [AVAudioSession sharedInstance];
     NSError *err = nil;
@@ -72,87 +120,94 @@ static void LPEnsureAudioSession(void) {
            options:AVAudioSessionCategoryOptionDefaultToSpeaker |
                    AVAudioSessionCategoryOptionAllowBluetooth
              error:&err];
-    if (err) { LPLog(@"[media] audio session lỗi: %@", err.localizedDescription); return; }
+    if (err) { LPLog(@"[media] audio category lỗi: %@", err.localizedDescription); return; }
     [s setActive:YES withOptions:0 error:&err];
-    if (err) LPLog(@"[media] active audio lỗi: %@", err.localizedDescription);
+    if (err) LPLog(@"[media] audio active lỗi: %@", err.localizedDescription);
 }
 
-// App gọi setActive:NO khi bắt đầu quay → giữ lại, và đảm bảo category đúng.
 static BOOL (*gOrigSetActive)(id, SEL, BOOL, NSUInteger, NSError **);
 static BOOL LPSetActive(id self, SEL _cmd, BOOL active, NSUInteger opts, NSError **err) {
     if (!active && [[LPConfig shared] flag:@"keepMicOnRecord" fallback:YES]) {
-        LPLog(@"[media] app tắt audio session → giữ lại để video có tiếng");
         LPEnsureAudioSession();
         return YES;
     }
     IMP o = LPOrigIMPFor(self, _cmd);
-    return o ? ((BOOL (*)(id, SEL, BOOL, NSUInteger, NSError **))o)(self, _cmd, active, opts, err) : NO;
+    return o ? ((BOOL (*)(id, SEL, BOOL, NSUInteger, NSError **))o)(self, _cmd, active, opts, err)
+             : NO;
 }
 
-#pragma mark - thêm micro vào session quay nếu app không thêm
-
-// AVCaptureSession của Locket có thể chỉ có video input. Nếu thiếu audio input,
-// file quay ra không có tiếng. Thêm audio input ngay khi session bắt đầu.
 static void (*gOrigStartRunning)(id, SEL);
 static void LPStartRunning(id self, SEL _cmd) {
     @try {
-        if (![[LPConfig shared] flag:@"addMicInput" fallback:YES]) {
-            if (gOrigStartRunning) gOrigStartRunning(self, _cmd);
-            return;
-        }
-        // Đã có audio input thì thôi.
-        BOOL hasAudio = NO;
-        NSArray *inputs = ((NSArray *(*)(id, SEL))objc_msgSend)(self, @selector(inputs));
-        for (id input in inputs) {
-            NSArray *ports = ((NSArray *(*)(id, SEL))objc_msgSend)(input, @selector(ports));
-            for (id port in ports) {
-                NSString *t = ((id (*)(id, SEL))objc_msgSend)(port, @selector(mediaType));
-                if ([t isEqualToString:AVMediaTypeAudio]) { hasAudio = YES; break; }
-            }
-            if (hasAudio) break;
-        }
-        if (!hasAudio) {
-            AVCaptureDevice *mic = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-            if (mic) {
-                NSError *e = nil;
-                AVCaptureDeviceInput *devIn = [AVCaptureDeviceInput deviceInputWithDevice:mic error:&e];
-                if (devIn && ((BOOL (*)(id, SEL, id))objc_msgSend)(self, @selector(canAddInput:), devIn)) {
-                    ((BOOL (*)(id, SEL, id))objc_msgSend)(self, @selector(addInput:), devIn);
-                    LPLog(@"[media] đã thêm micro vào session quay");
-                } else if (e) {
-                    LPLog(@"[media] thêm micro lỗi: %@", e.localizedDescription);
+        if ([[LPConfig shared] flag:@"addMicInput" fallback:YES]) {
+            BOOL hasAudio = NO;
+            NSArray *inputs = ((NSArray *(*)(id, SEL))objc_msgSend)(self, @selector(inputs));
+            if ([inputs isKindOfClass:[NSArray class]]) {
+                for (id input in inputs) {
+                    NSArray *ports = ((NSArray *(*)(id, SEL))objc_msgSend)(input, @selector(ports));
+                    if (![ports isKindOfClass:[NSArray class]]) continue;
+                    for (id port in ports) {
+                        NSString *t = ((id (*)(id, SEL))objc_msgSend)(port, @selector(mediaType));
+                        if ([t isEqualToString:AVMediaTypeAudio]) { hasAudio = YES; break; }
+                    }
+                    if (hasAudio) break;
                 }
             }
+            if (!hasAudio) {
+                AVCaptureDevice *mic = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+                if (mic) {
+                    NSError *e = nil;
+                    AVCaptureDeviceInput *in = [AVCaptureDeviceInput deviceInputWithDevice:mic error:&e];
+                    if (in && ((BOOL (*)(id, SEL, id))objc_msgSend)(self, @selector(canAddInput:), in)) {
+                        ((BOOL (*)(id, SEL, id))objc_msgSend)(self, @selector(addInput:), in);
+                        LPLog(@"[media] thêm micro vào session quay");
+                    }
+                }
+            }
+            LPEnsureAudioSession();
         }
-        LPEnsureAudioSession();
-    } @catch (NSException *e) { LPLog(@"[media] mic lỗi: %@", e); }
+    } @catch (NSException *e) { LPLog(@"[media] mic: %@", e.reason); }
     if (gOrigStartRunning) gOrigStartRunning(self, _cmd);
 }
 
 #pragma mark - install
 
 void LPInstallMediaHooks(void) {
-    if (gMediaHooksInstalled) return;
-    gMediaHooksInstalled = YES;
+    if (gMediaInstalled) return;
+    gMediaInstalled = YES;
 
     Class out = NSClassFromString(@"AVCaptureMovieFileOutput");
-    LPMHook(out, @selector(setMaxRecordedDuration:), (IMP)LPMovieMaxDurationSet);
-    LPMHook(out, @selector(setMaxRecordedFileSize:), (IMP)LPMovieMaxSizeSet);
+    BOOL a = LPHookMethodTyped(out, @selector(setMaxRecordedDuration:), "v",
+                               (IMP)LPMaxDuration, NULL);
+    BOOL b = LPHookMethodTyped(out, @selector(setMaxRecordedFileSize:), "v",
+                               (IMP)LPMaxFileSize, NULL);
+    LPLog(@"[media] AVCaptureMovieFileOutput duration=%d size=%d", a, b);
 
-    // AVAssetExportSession do LPExport.m phụ trách — hook 2 lần sẽ đệ quy.
+    Class exp = NSClassFromString(@"AVAssetExportSession");
+    BOOL c = LPHookMethodTyped(exp, @selector(setFileLengthLimit:), "v",
+                               (IMP)LPExportFileLengthLimit, NULL);
+    BOOL d = LPHookMethodTyped(exp, @selector(setTimeRange:), "v",
+                               (IMP)LPExportTimeRange, NULL);
+    BOOL e = LPHookMethodTyped(exp, @selector(setCanPerformMultiplePassesOverSourceMediaData:), "v",
+                               (IMP)LPExportMultiPass, NULL);
+    LPLog(@"[media] AVAssetExportSession limit=%d range=%d multipass=%d", c, d, e);
 
     Class picker = NSClassFromString(@"UIImagePickerController");
-    LPMHook(picker, @selector(setVideoMaximumDuration:), (IMP)LPPickerMaxDurSet);
+    BOOL f = LPHookMethodTyped(picker, @selector(setVideoMaximumDuration:), "v",
+                               (IMP)LPPickerMaxDuration, NULL);
+    LPLog(@"[media] UIImagePickerController duration=%d", f);
 
     Class sess = NSClassFromString(@"AVAudioSession");
-    if (LPHookMethod(sess, @selector(setActive:withOptions:error:), (IMP)LPSetActive, (IMP *)&gOrigSetActive)) {
-        LPLog(@"[media] hook AVAudioSession.setActive");
+    if (LPHookMethod(sess, @selector(setActive:withOptions:error:),
+                     (IMP)LPSetActive, (IMP *)&gOrigSetActive)) {
+        LPLog(@"[media] AVAudioSession.setActive");
     }
 
-    Class capSession = NSClassFromString(@"AVCaptureSession");
-    if (LPHookMethod(capSession, @selector(startRunning), (IMP)LPStartRunning, (IMP *)&gOrigStartRunning)) {
-        LPLog(@"[media] hook AVCaptureSession.startRunning");
+    Class cap = NSClassFromString(@"AVCaptureSession");
+    if (LPHookMethod(cap, @selector(startRunning), (IMP)LPStartRunning,
+                     (IMP *)&gOrigStartRunning)) {
+        LPLog(@"[media] AVCaptureSession.startRunning");
     }
 
-    LPLog(@"[media] trần đặt: %.0fs / %.0fMB", LPVideoSeconds(), LPVideoBytes() / 1048576.0);
+    LPLog(@"[media] trần: %.0fs / %.0fMB", LPVideoSeconds(), LPVideoBytes() / 1048576.0);
 }

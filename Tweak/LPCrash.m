@@ -1,50 +1,48 @@
+// ============================================================================
+//  LPCrash.m — bắt crash + tự bật chế độ an toàn
+//
+//  Vì sao dùng boot.ok thay vì UIApplicationWillTerminateNotification:
+//  iOS KHÔNG gọi notification đó khi người dùng vuốt app khỏi app switcher →
+//  cờ còn lại → lần sau tưởng crash → safeMode bật vĩnh viễn (tweak chết im).
+//
+//  Cơ chế:
+//    • Đầu boot: xoá boot.ok + boot.trace
+//    • Ghi từng bước vào boot.trace (flush ngay)
+//    • Sau 8s sống sót: ghi boot.ok
+//    • Lần mở sau: có trace mà thiếu ok → lần trước chết giữa chừng
+//      → tăng crash.count; >=2 → safeMode
+// ============================================================================
+
 #import "LPCommon.h"
 #import <signal.h>
 #import <execinfo.h>
 
-//
-// LPCrash — bắt crash + tự bật chế độ an toàn.
-//
-// VẤN ĐỀ của cách cũ: dựa vào UIApplicationWillTerminateNotification để biết
-// "lần trước thoát sạch". iOS KHÔNG gọi notification đó khi người dùng vuốt
-// app khỏi app switcher → cờ còn lại → lần sau tưởng crash → bật safeMode
-// vĩnh viễn (tweak chết im lặng).
-//
-// CÁCH MỚI: mốc "đã boot xong và sống 8 giây" (boot.ok).
-//   • Đầu boot: xoá boot.ok
-//   • Sau 8s chạy ổn: ghi boot.ok
-//   • Lần mở sau: thiếu boot.ok + có boot.trace → lần trước chết giữa chừng
-//     → bật safeMode, và ghi lại bước cuối cùng vào crash.txt
-//
-
-static NSString *LPDir(void) {
-    NSString *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-    return [d stringByAppendingPathComponent:@"LocketPlus"];
-}
-
-static NSString *LPPath(NSString *name) {
-    return [LPDir() stringByAppendingPathComponent:name];
-}
-
-void LPWriteCrashText(NSString *text) {
-    [[NSFileManager defaultManager] createDirectoryAtPath:LPDir()
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    [text writeToFile:LPPath(@"crash.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
-}
-
 #pragma mark - ghi crash
 
+void LPWriteCrashText(NSString *text) {
+    if (!text) return;
+    [text writeToFile:LPPath(@"crash.txt") atomically:YES
+             encoding:NSUTF8StringEncoding error:nil];
+}
+
 static void LPWriteCrash(const char *why, int sig) {
-    // Không dùng Foundation ở đây: có thể đang ở giữa lúc heap hỏng.
-    void *frames[64];
-    int n = backtrace(frames, 64);
-    char **syms = backtrace_symbols(frames, n);
-    NSMutableString *s = [NSMutableString stringWithFormat:@"Locket+ crash: %s (signal %d)\n", why, sig];
-    NSString *trace = [NSString stringWithContentsOfFile:LPPath(@"boot.trace")
-                                                encoding:NSUTF8StringEncoding error:nil];
-    if (trace.length) [s appendFormat:@"bước cuối: %@\n", trace];
-    for (int i = 0; i < n; i++) [s appendFormat:@"%s\n", syms[i]];
-    [s writeToFile:LPPath(@"crash.txt") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    // Chỉ dùng hàm async-signal-safe tối thiểu; Foundation ở đây có thể chết
+    // nếu crash xảy ra khi heap hỏng → bọc @try và bỏ qua nếu fail.
+    @try {
+        void *frames[64];
+        int n = backtrace(frames, 64);
+        NSMutableString *s = [NSMutableString stringWithFormat:
+            @"Locket+ crash: %s (signal %d)\n", why, sig];
+        NSString *trace = [NSString stringWithContentsOfFile:LPPath(@"boot.trace")
+                                                    encoding:NSUTF8StringEncoding error:nil];
+        if (trace.length) [s appendFormat:@"bước cuối: %@\n", trace];
+        char **syms = backtrace_symbols(frames, n);
+        if (syms) {
+            for (int i = 0; i < n; i++) [s appendFormat:@"%s\n", syms[i]];
+            free(syms);
+        }
+        LPWriteCrashText(s);
+    } @catch (__unused NSException *e) {}
 }
 
 static void LPSignalHandler(int sig) {
@@ -54,58 +52,68 @@ static void LPSignalHandler(int sig) {
 }
 
 static void LPExceptionHandler(NSException *e) {
-    NSString *trace = [NSString stringWithContentsOfFile:LPPath(@"boot.trace")
-                                                encoding:NSUTF8StringEncoding error:nil];
-    NSString *s = [NSString stringWithFormat:@"Locket+ exception: %@\nreason: %@\nbước cuối: %@\n%@\n",
-                   e.name, e.reason, trace ?: @"(không có)", e.callStackSymbols];
-    LPWriteCrashText(s);
+    @try {
+        NSString *trace = [NSString stringWithContentsOfFile:LPPath(@"boot.trace")
+                                                    encoding:NSUTF8StringEncoding error:nil];
+        NSString *s = [NSString stringWithFormat:
+            @"Locket+ exception: %@\nreason: %@\nbước cuối: %@\n%@\n",
+            e.name, e.reason, trace ?: @"(không có)", e.callStackSymbols];
+        LPWriteCrashText(s);
+    } @catch (__unused NSException *e2) {}
 }
 
-#pragma mark - boot ổn định
+#pragma mark - boot trace
+
+void LPBootStep(const char *name) {
+    @try {
+        NSString *p = LPPath(@"boot.trace");
+        NSString *line = [NSString stringWithFormat:@"%s\n", name];
+        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        if (!fh) { [d writeToFile:p atomically:YES]; return; }
+        [fh seekToEndOfFile];
+        [fh writeData:d];
+        [fh closeFile];
+    } @catch (__unused NSException *e) {}
+}
+
+#pragma mark - install
 
 void LPInstallCrashHandler(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    [fm createDirectoryAtPath:LPDir() withIntermediateDirectories:YES attributes:nil error:nil];
+    (void)fm;
 
     NSString *okPath = LPPath(@"boot.ok");
     NSString *tracePath = LPPath(@"boot.trace");
-
-    // Lần trước có boot nhưng không đạt mốc 8 giây → đã chết giữa chừng.
     BOOL hadTrace = [fm fileExistsAtPath:tracePath];
     BOOL hadOk = [fm fileExistsAtPath:okPath];
+
     if (hadTrace && !hadOk) {
         NSString *last = [NSString stringWithContentsOfFile:tracePath
                                                    encoding:NSUTF8StringEncoding error:nil];
-        NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:[LPConfig path:@"config.plist"]] mutableCopy]
-                                 ?: [NSMutableDictionary dictionary];
-        d[@"safeMode"] = @YES;
-        [d writeToFile:[LPConfig path:@"config.plist"] atomically:YES];
-        LPWriteCrashText([NSString stringWithFormat:
-            @"Lần chạy trước chết trước khi boot xong.\nbước cuối: %@\n\nĐã bật safeMode.\n"
-            @"Xem log.txt để biết thêm. Tắt safeMode bằng cách sửa config.plist.",
-            last ?: @"(không rõ)"]);
-        NSLog(@"[Locket+] lần trước chết ở bước: %@", last);
-    }
-
-    // Đếm số lần chết liên tiếp. >=2 → lần sau không hook gì (cứu hộ khẩn cấp),
-    // để app LUÔN mở được dù tweak có lỗi gì.
-    NSString *countPath = LPPath(@"crash.count");
-    int crashes = [[NSString stringWithContentsOfFile:countPath
-                                            encoding:NSUTF8StringEncoding error:nil] intValue];
-    if (hadTrace && !hadOk) {
-        crashes++;
+        // Đếm số lần chết liên tiếp.
+        NSString *countPath = LPPath(@"crash.count");
+        int crashes = [[NSString stringWithContentsOfFile:countPath
+                                                encoding:NSUTF8StringEncoding error:nil] intValue] + 1;
         [[NSString stringWithFormat:@"%d", crashes]
             writeToFile:countPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
         if (crashes >= 2) {
-            NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:[LPConfig path:@"config.plist"]] mutableCopy]
+            NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:LPPath(@"config.plist")] mutableCopy]
                                      ?: [NSMutableDictionary dictionary];
             d[@"safeMode"] = @YES;
-            [d writeToFile:[LPConfig path:@"config.plist"] atomically:YES];
-            NSLog(@"[Locket+] chết %d lần liên tiếp → khoá hook (safeMode)", crashes);
+            [d writeToFile:LPPath(@"config.plist") atomically:YES];
+            [LPConfig shared].plist = d;
+            NSLog(@"[Locket+] chết %d lần → safeMode", crashes);
         }
+
+        LPWriteCrashText([NSString stringWithFormat:
+            @"Lần chạy trước chết trước khi boot xong (lần %d).\nbước cuối: %@\n\n"
+            @"Xem log.txt. safeMode=%@ trong Documents/LocketPlus/config.plist.",
+            crashes, last ?: @"(không rõ)", crashes >= 2 ? @"YES" : @"NO"]);
     }
 
-    // Bắt đầu lượt mới: xoá mốc, ghi trace trống.
+    // Lượt mới.
     [fm removeItemAtPath:okPath error:nil];
     [fm removeItemAtPath:tracePath error:nil];
 
@@ -115,13 +123,12 @@ void LPInstallCrashHandler(void) {
     signal(SIGBUS, LPSignalHandler);
     signal(SIGILL, LPSignalHandler);
     signal(SIGFPE, LPSignalHandler);
+    signal(SIGTRAP, LPSignalHandler);
 }
 
-// Gọi 8 giây sau boot: nếu app còn sống tới đây thì coi như boot thành công.
 void LPMarkBootOK(void) {
-    [[NSFileManager defaultManager] createDirectoryAtPath:LPDir()
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    [@"ok" writeToFile:LPPath(@"boot.ok") atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    // Boot sống 8 giây → reset bộ đếm crash.
+    [@"ok" writeToFile:LPPath(@"boot.ok") atomically:YES
+             encoding:NSUTF8StringEncoding error:nil];
+    // Boot sống 8s → reset bộ đếm.
     [[NSFileManager defaultManager] removeItemAtPath:LPPath(@"crash.count") error:nil];
 }
