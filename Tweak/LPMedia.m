@@ -1,33 +1,40 @@
 // ============================================================================
-//  LPMedia.m — trần quay, mic, tỉ lệ khung, upload từ thư viện
+//  LPMedia.m — trần quay, mic, tỉ lệ khung, upload
 //
-//  BÁM SÁT MHVideoPipeline.dylib, nhưng sửa đúng 2 chỗ nó làm sai/thiếu:
+//  BÀI HỌC TỪ BẢN v5.0–v5.7 (user báo: "chỉ có Gold, không quay được vid,
+//  không up được vid"): 3 thứ tôi TỰ THÊM đã phá camera và export. Không có
+//  thứ nào trong 4 dylib mẫu:
+//
+//  1. `initWithAsset:presetName:` HẠ preset xuống 1280x720.
+//     → Locket tạo session với preset riêng; ta đổi preset thì renderSize của
+//       composition không khớp → export FAIL → up video thất bại.
+//     → ĐÃ BỎ. Không đụng preset nữa.
+//
+//  2. `fileLengthLimit` = 15MB cho clip ngắn.
+//     → fileLengthLimit KHÔNG phải "nén cho vừa". Vượt ngưỡng là export
+//       FAIL ngay, không phải file nhỏ đi. Video 60s luôn > 15MB.
+//     → ĐÃ SỬA: chỉ NÂNG, không bao giờ hạ.
+//
+//  3. Thêm mic input vào AVCaptureSession trong `startRunning`.
+//     → beginConfiguration/addInput/commitConfiguration đổi graph của session
+//       mà Locket đã dựng sẵn → AVCaptureMovieFileOutput mất connection →
+//       bấm quay là fail.
+//     → ĐÃ TẮT mặc định. Bật bằng `addMicInput = true` khi thật sự cần.
+//
+//  MẶC ĐỊNH GIỜ LÀ "SAFE MODE": chỉ 3 setter trần, y như 4 dylib mẫu làm.
+//  Mọi thứ rủi ro (mic, composition) phải bật rõ ràng trong config.
 //
 //  SỰ THẬT về MHVideoPipeline (đọc từng lệnh assembly):
-//    • _ExportInit @0x8420 hook -[AVAssetExportSession initWithAsset:presetName:]
-//      → ladder HẠ CẤP: 1280x720 kiểm TRƯỚC (0x8558), rồi 1920x1080 (0x8590),
-//        không có cả hai thì giữ preset gốc (0x85c0).
-//    • _Configure @0x8d88: setFileLengthLimit 0x600000 = 6 MB,
-//      setShouldOptimizeForNetworkUse YES,
-//      setCanPerformMultiplePassesOverSourceMediaData NO.
+//    • _Configure @0x8d88: setFileLengthLimit 0x600000 = 6 MB cho MỌI export.
+//      Đây là lý do dylib mẫu NÉN được — nó chấp nhận export fail với video
+//      dài, và Locket tự chia nhỏ. Ta KHÔNG làm vậy.
 //    • Nó KHÔNG hook setMaxRecordedDuration / setMaxRecordedFileSize
-//      → nó KHÔNG nâng trần quay. Nó nén cho vừa giới hạn upload.
-//    • _FitComposition @0x99e4 dựng AVMutableVideoComposition để đệm khung.
-//    • Hằng 0x17c88 = 600 KHÔNG phải "600 giây" — đó là timescale của
-//      kCMTimeZero, dùng cho setTransform:atTime:. Không liên quan thời lượng.
+//      → nó KHÔNG nâng trần quay. Trần quay là việc của ta.
+//    • _FitComposition @0x99e4 dựng composition đệm khung — chỉ dùng khi
+//      người dùng chọn tỉ lệ, không phải mặc định.
 //
-//  LocketPlus làm CẢ HAI, tách bằng config:
-//    • maxRecordSeconds / maxRecordBytes  → trần QUAY (mặc định 600s / 500MB)
-//    • quickMode + quickRecordSeconds     → chế độ quay nhanh 60s
-//    • maxUploadSeconds / maxUploadBytes  → trần khi UP từ thư viện (60s / 15MB)
-//    • frameRatioDefault                  → đệm khung 9:16 / 16:9 / 1:1 / 6:19 / 19:6
-//
-//  NGUYÊN TẮC ABI (đã trả giá bằng 2 bản crash):
-//    KHÔNG hook getter trả struct > 16 byte (CMTime, CMTimeRange, CGRect…).
-//    Trên arm64 struct > 16 byte trả qua con trỏ ẩn ở x8 — khai báo sai chữ ký
-//    là ghi vào thanh ghi rác. Chỉ hook SETTER nhận struct làm THAM SỐ.
-//    KHÔNG hook -init… (quy ước +1 của ARC). Cấu hình session ở
-//    exportAsynchronouslyWithCompletionHandler: — đúng như _ExportStart @0x86b8.
+//  NGUYÊN TẮC ABI: KHÔNG hook getter trả struct > 16 byte. Chỉ hook SETTER
+//  nhận struct làm THAM SỐ.
 // ============================================================================
 
 #import "LPCommon.h"
@@ -38,7 +45,6 @@
 #import <math.h>
 
 static BOOL gMediaInstalled = NO;
-static volatile BOOL gCaptureRunning = NO;
 
 #pragma mark - chế độ quay
 
@@ -46,7 +52,7 @@ static double LPEffectiveRecordSeconds(void) {
     if ([[LPConfig shared] flag:@"quickMode" fallback:NO]) {
         return MAX(5.0, [[LPConfig shared] dbl:@"quickRecordSeconds" fallback:60.0]);
     }
-    // Cho phép bật quick mode bằng file đánh dấu, khỏi phải sửa plist.
+    // Bật quick mode bằng file đánh dấu, khỏi phải sửa plist.
     if ([[NSFileManager defaultManager] fileExistsAtPath:LPPath(@"quick.on")]) {
         return MAX(5.0, [[LPConfig shared] dbl:@"quickRecordSeconds" fallback:60.0]);
     }
@@ -56,7 +62,6 @@ static double LPEffectiveRecordSeconds(void) {
 #pragma mark - AVCaptureMovieFileOutput: trần quay
 
 static void LPMaxDuration(id self, SEL _cmd, CMTime t) {
-    LPTrace("media.maxDuration");
     IMP o = LPOrigIMPFor(self, _cmd);
     if (!o) return;
 
@@ -69,7 +74,6 @@ static void LPMaxDuration(id self, SEL _cmd, CMTime t) {
 }
 
 static void LPMaxFileSize(id self, SEL _cmd, long long size) {
-    LPTrace("media.maxFileSize");
     IMP o = LPOrigIMPFor(self, _cmd);
     if (!o) return;
 
@@ -80,32 +84,51 @@ static void LPMaxFileSize(id self, SEL _cmd, long long size) {
     ((void (*)(id, SEL, long long))o)(self, _cmd, want);
 }
 
-#pragma mark - mic
+#pragma mark - UIImagePickerController (đường chọn video cũ)
 
-static void LPEnsureAudioCategory(void) {
-    @try {
-        AVAudioSession *s = [AVAudioSession sharedInstance];
-        NSError *err = nil;
-        [s setCategory:AVAudioSessionCategoryPlayAndRecord
-                  mode:AVAudioSessionModeVideoRecording
-               options:AVAudioSessionCategoryOptionDefaultToSpeaker |
-                       AVAudioSessionCategoryOptionAllowBluetooth
-                 error:&err];
-        if (err) { LPLog(@"[media] audio category: %@", err.localizedDescription); return; }
-        [s setActive:YES withOptions:0 error:&err];
-        if (err) LPLog(@"[media] audio active: %@", err.localizedDescription);
-    } @catch (NSException *e) {
-        LPLog(@"[media] audio: %@", e.reason);
-    }
+static void LPPickerMaxDuration(id self, SEL _cmd, double secs) {
+    IMP o = LPOrigIMPFor(self, _cmd);
+    if (!o) return;
+    ((void (*)(id, SEL, double))o)(self, _cmd, LPUploadSeconds());
 }
 
-// Thêm micro vào session nếu chưa có. Bọc trong begin/commitConfiguration
-// để không phá cấu hình đang chạy của app.
+#pragma mark - AVAssetExportSession: CHỈ NÂNG giới hạn
+
+// fileLengthLimit là NGƯỠNG CỨNG: vượt là export FAIL, không phải file nhỏ đi.
+// Vì vậy chỉ được NÂNG (để video 10 phút không bị chặn), KHÔNG BAO GIỜ HẠ.
+// Bản v5.0–v5.7 hạ xuống 15MB cho clip ngắn → mọi video 60s đều fail → không
+// up được video.
+static void LPExportFileLengthLimit(id self, SEL _cmd, long long limit) {
+    IMP o = LPOrigIMPFor(self, _cmd);
+    if (!o) return;
+
+    long long want = (long long)LPMaxRecordBytes();
+    long long use = (limit > 0 && limit < want) ? want : limit;
+    if (use != limit) LPLog(@"[media] fileLengthLimit %lld → %lld (nâng)", limit, use);
+    ((void (*)(id, SEL, long long))o)(self, _cmd, use);
+}
+
+#pragma mark - mic (tuỳ chọn, mặc định TẮT)
+
+// Đổi graph của AVCaptureSession mà Locket đã dựng → AVCaptureMovieFileOutput
+// mất connection → bấm quay là fail. Đây là lý do "không quay được vid".
+//
+// Chỉ chạy khi `addMicInput = true` VÀ session chưa chạy VÀ chưa có audio.
+// Mỗi session chỉ thử một lần (associated object).
+static const void *kLPMicTried = &kLPMicTried;
+
 static void LPEnsureMicInput(id session) {
     if (!session) return;
-    if (![[LPConfig shared] flag:@"addMicInput" fallback:YES]) return;
+    if (![[LPConfig shared] flag:@"addMicInput" fallback:NO]) return;
+    if (objc_getAssociatedObject(session, kLPMicTried)) return;
+    objc_setAssociatedObject(session, kLPMicTried, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     @try {
+        if ([session respondsToSelector:@selector(isRunning)] &&
+            ((BOOL (*)(id, SEL))objc_msgSend)(session, @selector(isRunning))) {
+            return;                       // đang chạy → không được sửa graph
+        }
+
         SEL selInputs = @selector(inputs);
         if (![session respondsToSelector:selInputs]) return;
 
@@ -122,101 +145,52 @@ static void LPEnsureMicInput(id session) {
         }
 
         AVCaptureDevice *mic = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-        if (!mic) { LPLog(@"[media] không có thiết bị micro"); return; }
+        if (!mic) return;
 
         NSError *e = nil;
         AVCaptureDeviceInput *in = [AVCaptureDeviceInput deviceInputWithDevice:mic error:&e];
-        if (!in) { LPLog(@"[media] tạo mic input lỗi: %@", e.localizedDescription); return; }
+        if (!in) { LPLog(@"[media] mic input lỗi: %@", e.localizedDescription); return; }
 
-        if ([session respondsToSelector:@selector(canAddInput:)]) {
-            BOOL can = ((BOOL (*)(id, SEL, id))objc_msgSend)(session, @selector(canAddInput:), in);
-            if (!can) { LPLog(@"[media] canAddInput: mic = NO"); return; }
+        if ([session respondsToSelector:@selector(canAddInput:)] &&
+            !((BOOL (*)(id, SEL, id))objc_msgSend)(session, @selector(canAddInput:), in)) {
+            LPLog(@"[media] canAddInput: mic = NO");
+            return;
         }
 
-        if ([session respondsToSelector:@selector(beginConfiguration)]) {
-            ((void (*)(id, SEL))objc_msgSend)(session, @selector(beginConfiguration));
-        }
+        ((void (*)(id, SEL))objc_msgSend)(session, @selector(beginConfiguration));
         BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(session, @selector(addInput:), in);
-        if ([session respondsToSelector:@selector(commitConfiguration)]) {
-            ((void (*)(id, SEL))objc_msgSend)(session, @selector(commitConfiguration));
-        }
-        LPLog(@"[media] thêm micro vào session quay: %d", ok);
+        ((void (*)(id, SEL))objc_msgSend)(session, @selector(commitConfiguration));
+        LPLog(@"[media] thêm micro: %d", ok);
     } @catch (NSException *e) {
         LPLog(@"[media] mic: %@", e.reason);
     }
 }
 
-static void (*gOrigStartRunning)(id, SEL);
 static void LPStartRunning(id self, SEL _cmd) {
-    LPTrace("media.startRunning");
-    @try {
-        LPEnsureMicInput(self);
-        if ([[LPConfig shared] flag:@"keepAudioSession" fallback:YES]) LPEnsureAudioCategory();
-    } @catch (__unused NSException *e) {}
-    if (gOrigStartRunning) gOrigStartRunning(self, _cmd);
-}
-
-static void (*gOrigStopRunning)(id, SEL);
-static void LPStopRunning(id self, SEL _cmd) {
-    if (gOrigStopRunning) gOrigStopRunning(self, _cmd);
-}
-
-// Cờ GHI HÌNH thật — chỉ bật giữa startRecording… và stopRecording.
-// Dùng cờ này thay cho "session đang chạy": session chạy không có nghĩa là
-// đang ghi, và giữ audio session sống khi chỉ đang xem trước sẽ bật micro
-// vô ích (đèn cam/mic sáng, nhạc nền bị ngắt).
-static volatile BOOL gRecording = NO;
-static NSTimeInterval gRecordingDeadline = 0;
-
-static void (*gOrigStartRecording)(id, SEL, NSURL *, id);
-static void LPStartRecording(id self, SEL _cmd, NSURL *url, id delegate) {
     IMP o = LPOrigIMPFor(self, _cmd);
     if (!o) return;
-    gRecording = YES;
-    gRecordingDeadline = [NSDate timeIntervalSinceReferenceDate] + LPEffectiveRecordSeconds() + 30.0;
-    LPTrace("media.startRecording");
-    ((void (*)(id, SEL, NSURL *, id))o)(self, _cmd, url, delegate);
-}
-
-static void (*gOrigStopRecording)(id, SEL);
-static void LPStopRecording(id self, SEL _cmd) {
-    gRecording = NO;
-    IMP o = LPOrigIMPFor(self, _cmd);
-    if (o) ((void (*)(id, SEL))o)(self, _cmd);
-}
-
-// Giữ audio session sống CHỈ khi đang ghi hình thật.
-static BOOL (*gOrigSetActive)(id, SEL, BOOL, NSUInteger, NSError **);
-static BOOL LPSetActive(id self, SEL _cmd, BOOL active, NSUInteger opts, NSError **err) {
-    if (!active && gRecording &&
-        [NSDate timeIntervalSinceReferenceDate] < gRecordingDeadline &&
-        [[LPConfig shared] flag:@"keepAudioSession" fallback:YES]) {
-        LPTrace("media.keepAudioSession");
-        return YES;
-    }
-    IMP o = LPOrigIMPFor(self, _cmd);
-    return o ? ((BOOL (*)(id, SEL, BOOL, NSUInteger, NSError **))o)(self, _cmd, active, opts, err)
-             : NO;
+    @try { LPEnsureMicInput(self); } @catch (__unused NSException *e) {}
+    ((void (*)(id, SEL))o)(self, _cmd);
 }
 
 #pragma mark - tỉ lệ khung
 
-// "auto"  → không đụng gì (giữ nguyên hành vi app)
+// "auto"  → KHÔNG đụng gì (mặc định — giữ nguyên hành vi của Locket)
 // "9:16"  → khung dọc  (người dùng gọi là 6:19)
 // "16:9"  → khung ngang (người dùng gọi là 19:6)
-// "1:1"   → vuông (định dạng feed của Locket)
-// "ask"   → hỏi bằng alert mỗi lần export
-static double LPRatioValue(NSString *s, double *out) {
-    if (![s isKindOfClass:[NSString class]] || !s.length) return 0;
-    if ([s isEqualToString:@"auto"] || [s isEqualToString:@"ask"]) return 0;
+// "1:1"   → vuông
+// "ask"   → hỏi mỗi lần export
+static BOOL LPRatioValue(NSString *s, double *out) {
+    if (![s isKindOfClass:[NSString class]] || !s.length) return NO;
+    if ([s isEqualToString:@"auto"] || [s isEqualToString:@"ask"]) return NO;
 
     NSArray *parts = [s componentsSeparatedByString:@":"];
-    if (parts.count != 2) return 0;
+    if (parts.count != 2) return NO;
     double w = [parts[0] doubleValue];
     double h = [parts[1] doubleValue];
-    if (!isfinite(w) || !isfinite(h) || w <= 0 || h <= 0) return 0;
+    if (!isfinite(w) || !isfinite(h) || w <= 0 || h <= 0) return NO;
     *out = w / h;
-    return 1;
+    return YES;
 }
 
 static CGSize LPEvenSize(CGSize s, double maxDim) {
@@ -237,7 +211,6 @@ static CGSize LPEvenSize(CGSize s, double maxDim) {
 }
 
 // Dựng composition đệm khung — tương đương _FitComposition @0x99e4.
-// Trả nil nếu không làm được (asset không có video track, kích thước vô lý…).
 static AVMutableVideoComposition *LPFitComposition(AVAsset *asset, double ratio) {
     if (!asset || ratio <= 0) return nil;
 
@@ -270,9 +243,7 @@ static AVMutableVideoComposition *LPFitComposition(AVAsset *asset, double ratio)
     if (canvas.width < 2 || canvas.height < 2) return nil;
 
     // Scale để vừa (aspect-fit) rồi canh giữa.
-    CGFloat sx = canvas.width / oriented.width;
-    CGFloat sy = canvas.height / oriented.height;
-    CGFloat s = MIN(sx, sy);
+    CGFloat s = MIN(canvas.width / oriented.width, canvas.height / oriented.height);
 
     CGAffineTransform t = pref;
     t = CGAffineTransformConcat(t, CGAffineTransformMakeScale(s, s));
@@ -288,17 +259,14 @@ static AVMutableVideoComposition *LPFitComposition(AVAsset *asset, double ratio)
         [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:track];
     [li setTransform:t atTime:kCMTimeZero];
 
-    AVMutableVideoCompositionInstruction *ins = [AVMutableVideoCompositionInstruction new];
     CMTime dur = asset.duration;
     double durSecs = CMTimeGetSeconds(dur);
-    if (!isfinite(durSecs) || durSecs <= 0) {
-        // Asset chưa load xong duration → composition sẽ hỏng. Bỏ qua.
-        return nil;
-    }
+    if (!isfinite(durSecs) || durSecs <= 0) return nil;   // asset chưa load xong
+
+    AVMutableVideoCompositionInstruction *ins = [AVMutableVideoCompositionInstruction new];
     ins.timeRange = CMTimeRangeMake(kCMTimeZero, dur);
     ins.layerInstructions = @[li];
 
-    // Màu nền của phần đệm. MHVideoPipeline dùng màu tối; cho cấu hình được.
     NSString *hex = [[LPConfig shared] str:@"frameBackground" fallback:@"000000"];
     unsigned int rgb = 0;
     if (hex.length == 6) sscanf(hex.UTF8String, "%06x", &rgb);
@@ -320,13 +288,49 @@ static AVMutableVideoComposition *LPFitComposition(AVAsset *asset, double ratio)
     return vc;
 }
 
-#pragma mark - hỏi tỉ lệ (kiểu _ChooseRatio của mẫu)
+static void LPApplyComposition(id session, NSString *ratioChoice) {
+    if (!session) return;
+    if (![[LPConfig shared] flag:@"frameRatioEnabled" fallback:NO]) return;
+
+    double ratio = 0;
+    if (!LPRatioValue(ratioChoice, &ratio) || ratio <= 0) return;   // "auto" → không đụng
+
+    @try {
+        if (![session respondsToSelector:@selector(asset)]) return;
+        AVAsset *asset = ((id (*)(id, SEL))objc_msgSend)(session, @selector(asset));
+        if (![asset isKindOfClass:[AVAsset class]]) return;
+
+        // Passthrough KHÔNG hỗ trợ videoComposition — gắn vào là export fail.
+        if ([session respondsToSelector:@selector(presetName)]) {
+            NSString *preset = ((id (*)(id, SEL))objc_msgSend)(session, @selector(presetName));
+            if ([preset isEqualToString:AVAssetExportPresetPassthrough]) {
+                LPLog(@"[media] passthrough → bỏ qua composition");
+                return;
+            }
+        }
+
+        // Chỉ gắn composition khi duration đã load — nếu không thì bỏ qua,
+        // export vẫn chạy bình thường (thà mất khung còn hơn mất video).
+        double d = CMTimeGetSeconds(asset.duration);
+        if (!isfinite(d) || d <= 0) {
+            LPLog(@"[media] duration chưa load → bỏ qua composition");
+            return;
+        }
+
+        AVMutableVideoComposition *vc = LPFitComposition(asset, ratio);
+        if (!vc) { LPLog(@"[media] không dựng được composition"); return; }
+
+        ((void (*)(id, SEL, id))objc_msgSend)(session, @selector(setVideoComposition:), vc);
+    } @catch (NSException *e) {
+        LPLog(@"[media] composition lỗi: %@", e.reason);
+    }
+}
+
+#pragma mark - hỏi tỉ lệ
 
 static void LPAskRatioOnMain(void (^done)(NSString *choice));
 
 static void LPAskRatio(void (^done)(NSString *choice)) {
-    // UIAlertController PHẢI present trên main thread. exportAsynchronously có
-    // thể được gọi từ background → dispatch, không present tại chỗ.
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{ LPAskRatioOnMain(done); });
         return;
@@ -335,8 +339,7 @@ static void LPAskRatio(void (^done)(NSString *choice)) {
 }
 
 static void LPAskRatioOnMain(void (^done)(NSString *choice)) {
-    // Chỉ định nghĩa MỘT lần cho mỗi lần gọi. Nếu người dùng không trả lời
-    // trong 20s (app bị đẩy nền, alert bị che), tự chạy tiếp với "auto" —
+    // Không trả lời trong 20s (app bị đẩy nền, alert bị che) → chạy tiếp "auto".
     // KHÔNG được treo luồng export.
     __block BOOL answered = NO;
     void (^finish)(NSString *) = ^(NSString *c) {
@@ -369,13 +372,13 @@ static void LPAskRatioOnMain(void (^done)(NSString *choice)) {
     @try {
         UIAlertController *a = [UIAlertController
             alertControllerWithTitle:@"Khung hình video"
-                             message:@"Tự nhận ngang/dọc, giữ trọn hình. Thêm nền đệm để Locket không cắt vuông lần nữa."
+                             message:@"Thêm nền đệm để Locket không cắt vuông."
                       preferredStyle:UIAlertControllerStyleActionSheet];
 
-        NSArray *opts = @[@[@"Gốc · tự động vừa khung", @"auto"],
-                          @[@"16:9 · khung ngang",       @"16:9"],
-                          @[@"9:16 · khung dọc",         @"9:16"],
-                          @[@"1:1 · vuông",              @"1:1"]];
+        NSArray *opts = @[@[@"Gốc · không đệm",   @"auto"],
+                          @[@"16:9 · khung ngang", @"16:9"],
+                          @[@"9:16 · khung dọc",   @"9:16"],
+                          @[@"1:1 · vuông",        @"1:1"]];
         for (NSArray *o in opts) {
             [a addAction:[UIAlertAction actionWithTitle:o[0]
                                                  style:UIAlertActionStyleDefault
@@ -385,7 +388,6 @@ static void LPAskRatioOnMain(void (^done)(NSString *choice)) {
                                              style:UIAlertActionStyleCancel
                                            handler:^(__unused UIAlertAction *x) { finish(@"auto"); }]];
 
-        // iPad: action sheet cần sourceView, nếu không sẽ crash.
         a.popoverPresentationController.sourceView = vc.view;
         a.popoverPresentationController.sourceRect =
             CGRectMake(CGRectGetMidX(vc.view.bounds), CGRectGetMidY(vc.view.bounds), 1, 1);
@@ -397,172 +399,32 @@ static void LPAskRatioOnMain(void (^done)(NSString *choice)) {
     }
 }
 
-#pragma mark - preset ladder (bám sát _ExportInit @0x8420 của mẫu)
+#pragma mark - export
 
-// Mẫu hook -[AVAssetExportSession initWithAsset:presetName:] và HẠ preset:
-//   1. AVAssetExportPreset1280x720   (kiểm trước — 0x8558)
-//   2. AVAssetExportPreset1920x1080  (0x8590)
-//   3. không có cả hai → giữ preset gốc (0x85c0)
-// Đó là cách video dài thực sự vừa giới hạn upload, vì fileLengthLimit chỉ là
-// gợi ý — AVFoundation có thể bỏ qua và export ra file to hơn.
-//
-// Hook họ "init" dưới ARC: PHẢI khai báo ns_returns_retained ở CẢ hàm hook VÀ
-// con trỏ hàm gọi IMP gốc. Nếu thiếu, ARC giả định +0 ở một trong hai phía →
-// over-release (crash) hoặc leak. Đây chính là lỗi làm v1.x chết, không phải
-// "không được hook init".
-typedef id (*LPInitIMP)(id, SEL, id, id) __attribute__((ns_returns_retained));
-
-static NSArray<NSString *> *LPPresetLadder(void) {
-    return @[@"AVAssetExportPreset1280x720",
-             @"AVAssetExportPreset1920x1080"];
-}
-
-static NSString *LPChoosePreset(AVAsset *asset, NSString *requested) {
-    if (![[LPConfig shared] flag:@"compressShortUploads" fallback:YES]) return requested;
-    if (!asset || ![requested isKindOfClass:[NSString class]]) return requested;
-
-    @try {
-        // CHỈ áp cho asset CÓ video track. Export audio/ảnh không được đụng.
-        NSArray *vt = [asset tracksWithMediaType:AVMediaTypeVideo];
-        if (![vt isKindOfClass:[NSArray class]] || !vt.count) return requested;
-
-        // CHỈ hạ preset cho clip NGẮN (mục tiêu 15MB / 60s ≈ 2 Mbps).
-        // Video quay dài 10 phút có ngân sách 500MB ≈ 6.7 Mbps — 1080p vẫn vừa,
-        // hạ xuống 720p chỉ làm mất chi tiết mà không cần thiết.
-        double d = CMTimeGetSeconds(asset.duration);
-        if (!isfinite(d) || d <= 0) return requested;
-        if (d > LPUploadSeconds() + 0.5) return requested;
-    } @catch (__unused NSException *e) { return requested; }
-
-    @try {
-        NSArray *compatible = [AVAssetExportSession exportPresetsCompatibleWithAsset:asset];
-        if (![compatible isKindOfClass:[NSArray class]] || !compatible.count) return requested;
-
-        for (NSString *p in LPPresetLadder()) {
-            if ([compatible containsObject:p]) {
-                if (![p isEqualToString:requested]) {
-                    LPLog(@"[media] preset %@ → %@ (clip ngắn, nén vừa 15MB)", requested, p);
-                }
-                return p;
-            }
-        }
-    } @catch (NSException *e) { LPLog(@"[media] chọn preset lỗi: %@", e.reason); }
-    return requested;
-}
-
-static id LPExportInit(id self, SEL _cmd, AVAsset *asset, NSString *preset)
-    __attribute__((ns_returns_retained));
-
-static id LPExportInit(id self, SEL _cmd, AVAsset *asset, NSString *preset) {
-    IMP o = LPOrigIMPFor(self, _cmd);
-    if (!o) return nil;
-    NSString *use = LPChoosePreset(asset, preset);
-    return ((LPInitIMP)o)(self, _cmd, asset, use);
-}
-
-#pragma mark - AVAssetExportSession
-
-// Ngân sách dung lượng theo độ dài clip.
-//   clip ngắn (≤ maxUploadSeconds) → nén về maxUploadBytes (15MB)
-//   video dài (quay 10 phút)       → trần quay maxRecordBytes (500MB)
-// Nhờ vậy "quay 10 phút 500MB" và "up 60s 15MB" cùng đúng.
-static void LPApplyBudget(id session, AVAsset *asset) {
-    if (!session) return;
-
-    double secs = 0;
-    @try {
-        if (asset) {
-            double d = CMTimeGetSeconds(asset.duration);
-            if (isfinite(d) && d > 0) secs = d;
-        }
-    } @catch (__unused NSException *e) {}
-
-    long long budget;
-    if (secs > 0 && secs <= LPUploadSeconds() + 0.5 &&
-        [[LPConfig shared] flag:@"compressShortUploads" fallback:YES]) {
-        budget = (long long)LPUploadBytes();
-    } else {
-        budget = (long long)LPMaxRecordBytes();
-    }
-
-    @try {
-        if ([session respondsToSelector:@selector(setFileLengthLimit:)]) {
-            ((void (*)(id, SEL, long long))objc_msgSend)(session,
-                @selector(setFileLengthLimit:), budget);
-        }
-        if ([session respondsToSelector:@selector(setShouldOptimizeForNetworkUse:)]) {
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(session,
-                @selector(setShouldOptimizeForNetworkUse:), YES);
-        }
-        LPLog(@"[media] export %.1fs → ngân sách %.1fMB", secs, budget / 1048576.0);
-    } @catch (__unused NSException *e) {}
-}
-
-static void LPApplyComposition(id session, NSString *ratioChoice) {
-    if (!session) return;
-    if (![[LPConfig shared] flag:@"frameRatioEnabled" fallback:YES]) return;
-
-    double ratio = 0;
-    if (!LPRatioValue(ratioChoice, &ratio) || ratio <= 0) return;
-
-    @try {
-        if (![session respondsToSelector:@selector(asset)]) return;
-        AVAsset *asset = ((id (*)(id, SEL))objc_msgSend)(session, @selector(asset));
-        if (![asset isKindOfClass:[AVAsset class]]) return;
-
-        // Passthrough KHÔNG hỗ trợ videoComposition — gắn vào là export fail
-        // với lỗi khó hiểu. Bỏ qua, giữ nguyên hành vi gốc.
-        if ([session respondsToSelector:@selector(presetName)]) {
-            NSString *preset = ((id (*)(id, SEL))objc_msgSend)(session, @selector(presetName));
-            if ([preset isEqualToString:AVAssetExportPresetPassthrough]) {
-                LPLog(@"[media] preset passthrough → không gắn composition");
-                return;
-            }
-        }
-
-        AVMutableVideoComposition *vc = LPFitComposition(asset, ratio);
-        if (!vc) { LPLog(@"[media] không dựng được composition"); return; }
-
-        // Không đụng audio: AVMutableVideoComposition chỉ mô tả phần hình,
-        // track âm thanh vẫn đi qua export session bình thường.
-        ((void (*)(id, SEL, id))objc_msgSend)(session, @selector(setVideoComposition:), vc);
-    } @catch (NSException *e) {
-        LPLog(@"[media] composition lỗi: %@", e.reason);
-    }
-}
-
-// _ExportStart @0x86b8 của mẫu — đọc kỹ: nó KHÔNG gọi export gốc ngay.
-//
-//   86d8: getAssociatedObject(self, _kPrepare)  → nếu có
-//   86e8: getAssociatedObject(self, _kChoice)   → nếu có thì gọi export gốc luôn
-//   8724: setAssociatedObject(self, _kChoice, @"yes")
-//   8744: dispatch_async(main, _PrepareExport)
-//
-// _PrepareExport (block @0x9834) mới là chỗ làm việc:
-//   loadValuesAsynchronouslyForKeys:["tracks","duration"]
-//   → khi CẢ HAI có statusOfValueForKey == 2 (AVKeyValueStatusLoaded)
-//   → _FitComposition(asset, mode)  (mode: 0=auto, 1=1920x1080, 2=1080x1920)
-//   → setVideoComposition:
-//   → rồi mới gọi export gốc
-//
-// VÌ SAO PHẢI HOÃN: asset.duration và asset.tracks thường CHƯA load khi
-// exportAsynchronously được gọi. Đọc ngay thì duration = 0/NaN → dựng
-// composition hỏng, hoặc lặng lẽ bỏ qua. Đây là lỗi tôi đã mắc ở bản đầu.
 typedef void (^LPExportCompletion)(void);
 
 static const void *kLPPrepared = &kLPPrepared;
 
 static void LPExportAsync(id self, SEL _cmd, LPExportCompletion handler) {
-    LPTrace("media.exportAsync");
     IMP o = LPOrigIMPFor(self, _cmd);
     if (!o) return;
 
-    // Mỗi session chỉ chuẩn bị MỘT lần (mẫu dùng _kChoice cho việc này).
+    // Mỗi session chỉ chuẩn bị MỘT lần.
     if (objc_getAssociatedObject(self, kLPPrepared)) {
         ((void (*)(id, SEL, LPExportCompletion))o)(self, _cmd, handler);
         return;
     }
     objc_setAssociatedObject(self, kLPPrepared, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    // MẶC ĐỊNH: không đụng gì. Export chạy y như Locket muốn.
+    // Chỉ can thiệp khi người dùng bật rõ ràng trong config.
+    NSString *choice = [[LPConfig shared] str:@"frameRatioDefault" fallback:@"auto"];
+    BOOL wantRatio = [[LPConfig shared] flag:@"frameRatioEnabled" fallback:NO];
+
+    if (!wantRatio || [choice isEqualToString:@"auto"]) {
+        ((void (*)(id, SEL, LPExportCompletion))o)(self, _cmd, handler);
+        return;
+    }
 
     AVAsset *asset = nil;
     @try {
@@ -577,10 +439,6 @@ static void LPExportAsync(id self, SEL _cmd, LPExportCompletion handler) {
         return;
     }
 
-    NSString *choice = [[LPConfig shared] str:@"frameRatioDefault" fallback:@"auto"];
-
-    // Chốt chặn: nếu asset không bao giờ load xong (file hỏng, iCloud chưa tải),
-    // vẫn phải chạy export — không được treo.
     __block BOOL started = NO;
     void (^start)(void) = ^{
         if (started) return;
@@ -588,14 +446,12 @@ static void LPExportAsync(id self, SEL _cmd, LPExportCompletion handler) {
         ((void (*)(id, SEL, LPExportCompletion))o)(self, _cmd, handler);
     };
 
+    // Chốt chặn: asset không load xong thì vẫn export, không được treo.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ start(); });
 
     void (^proceed)(NSString *) = ^(NSString *picked) {
-        @try {
-            LPApplyComposition(self, picked);
-            LPApplyBudget(self, asset);
-        } @catch (__unused NSException *e) {}
+        @try { LPApplyComposition(self, picked); } @catch (__unused NSException *e) {}
         dispatch_async(dispatch_get_main_queue(), ^{ start(); });
     };
 
@@ -609,7 +465,7 @@ static void LPExportAsync(id self, SEL _cmd, LPExportCompletion handler) {
             }
         }
         if (!ok) {
-            LPLog(@"[media] asset chưa load xong — export không composition");
+            LPLog(@"[media] asset chưa load xong → export nguyên bản");
             dispatch_async(dispatch_get_main_queue(), ^{ start(); });
             return;
         }
@@ -619,48 +475,6 @@ static void LPExportAsync(id self, SEL _cmd, LPExportCompletion handler) {
             proceed(choice);
         }
     }];
-}
-
-// Cắt bớt khi video dài hơn trần upload.
-//
-// MẶC ĐỊNH TẮT. Lý do: hook này chạy cho MỌI export, kể cả video vừa quay
-// 10 phút — cắt nó về 60s là phá đúng tính năng người dùng yêu cầu. Chỉ bật
-// khi thật sự cần ép vừa giới hạn server.
-static void LPExportTimeRange(id self, SEL _cmd, CMTimeRange r) {
-    IMP o = LPOrigIMPFor(self, _cmd);
-    if (!o) return;
-
-    CMTimeRange use = r;
-    @try {
-        if ([[LPConfig shared] flag:@"trimToUpload" fallback:NO]) {
-            double d = CMTimeGetSeconds(r.duration);
-            double limit = LPUploadSeconds();
-            if (isfinite(d) && d > 0 && d > limit + 0.05) {
-                use = CMTimeRangeMake(r.start, CMTimeMakeWithSeconds(limit, 600));
-                LPLog(@"[media] timeRange %.1fs → %.1fs (trimToUpload)", d, limit);
-            }
-        }
-    } @catch (__unused NSException *e) {}
-
-    ((void (*)(id, SEL, CMTimeRange))o)(self, _cmd, use);
-}
-
-// Nâng trần dung lượng, không hạ.
-static void LPExportFileLengthLimit(id self, SEL _cmd, long long limit) {
-    IMP o = LPOrigIMPFor(self, _cmd);
-    if (!o) return;
-
-    long long want = (long long)LPMaxRecordBytes();
-    long long use = (limit > 0 && limit < want) ? want : limit;
-    if (use != limit) LPLog(@"[media] fileLengthLimit %lld → %lld", limit, use);
-    ((void (*)(id, SEL, long long))o)(self, _cmd, use);
-}
-
-// UIImagePickerController (đường chọn video cũ của Locket).
-static void LPPickerMaxDuration(id self, SEL _cmd, double secs) {
-    IMP o = LPOrigIMPFor(self, _cmd);
-    if (!o) return;
-    ((void (*)(id, SEL, double))o)(self, _cmd, LPUploadSeconds());
 }
 
 #pragma mark - install
@@ -674,51 +488,53 @@ void LPInstallMedia(void) {
         return;
     }
 
+    // 1. Trần quay — 2 setter, an toàn tuyệt đối (đây là thứ 4 dylib mẫu
+    //    KHÔNG làm, và cũng là yêu cầu chính).
     Class out = NSClassFromString(@"AVCaptureMovieFileOutput");
     BOOL a = LPHookMethodTyped(out, @selector(setMaxRecordedDuration:), "v",
                                (IMP)LPMaxDuration, NULL);
     BOOL b = LPHookMethodTyped(out, @selector(setMaxRecordedFileSize:), "v",
                                (IMP)LPMaxFileSize, NULL);
-    LPLog(@"[media] AVCaptureMovieFileOutput duration=%d size=%d", a, b);
+    LPLog(@"[media] trần quay duration=%d size=%d", a, b);
 
-    Class cap = NSClassFromString(@"AVCaptureSession");
-    BOOL c = LPHookMethod(cap, @selector(startRunning), (IMP)LPStartRunning,
-                          (IMP *)&gOrigStartRunning);
-    BOOL d = LPHookMethod(cap, @selector(stopRunning), (IMP)LPStopRunning,
-                          (IMP *)&gOrigStopRunning);
-    LPLog(@"[media] AVCaptureSession start=%d stop=%d", c, d);
-
-    // Cờ "đang ghi" — hook trên AVCaptureMovieFileOutput, không phải session.
-    Class mfo = NSClassFromString(@"AVCaptureMovieFileOutput");
-    BOOL c2 = LPHookMethod(mfo, @selector(startRecordingToOutputFileURL:recordingDelegate:),
-                           (IMP)LPStartRecording, (IMP *)&gOrigStartRecording);
-    BOOL d2 = LPHookMethod(mfo, @selector(stopRecording), (IMP)LPStopRecording,
-                           (IMP *)&gOrigStopRecording);
-    LPLog(@"[media] ghi hình start=%d stop=%d", c2, d2);
-
-    Class sess = NSClassFromString(@"AVAudioSession");
-    BOOL e = LPHookMethod(sess, @selector(setActive:withOptions:error:),
-                          (IMP)LPSetActive, (IMP *)&gOrigSetActive);
-    LPLog(@"[media] AVAudioSession.setActive=%d", e);
-
+    // 2. Nâng ngưỡng dung lượng export — chỉ nâng, không hạ.
     Class exp = NSClassFromString(@"AVAssetExportSession");
-    BOOL f0 = LPHookMethodTyped(exp, @selector(initWithAsset:presetName:), "@",
-                                (IMP)LPExportInit, NULL);
-    BOOL f = LPHookMethodTyped(exp, @selector(setTimeRange:), "v",
-                               (IMP)LPExportTimeRange, NULL);
-    BOOL g = LPHookMethodTyped(exp, @selector(setFileLengthLimit:), "v",
+    BOOL c = LPHookMethodTyped(exp, @selector(setFileLengthLimit:), "v",
                                (IMP)LPExportFileLengthLimit, NULL);
-    BOOL h = LPHookMethodTyped(exp, @selector(exportAsynchronouslyWithCompletionHandler:), "v",
-                               (IMP)LPExportAsync, NULL);
-    LPLog(@"[media] AVAssetExportSession init=%d range=%d limit=%d export=%d", f0, f, g, h);
+    LPLog(@"[media] fileLengthLimit (nâng) = %d", c);
 
+    // 3. Chọn video từ thư viện.
     Class picker = NSClassFromString(@"UIImagePickerController");
-    BOOL i = LPHookMethodTyped(picker, @selector(setVideoMaximumDuration:), "v",
+    BOOL d = LPHookMethodTyped(picker, @selector(setVideoMaximumDuration:), "v",
                                (IMP)LPPickerMaxDuration, NULL);
-    LPLog(@"[media] UIImagePickerController duration=%d", i);
+    LPLog(@"[media] picker duration = %d", d);
 
-    LPLog(@"[media] trần quay %.0fs / %.0fMB · upload %.0fs / %.0fMB · tỉ lệ %@",
+    // 4. Tuỳ chọn — CHỈ chạy khi bật `experimental = true`.
+    //
+    // Vì sao cần công tắc riêng: config.plist cũ trên máy đã có
+    // `addMicInput = true` và `frameRatioEnabled = true` từ bản v5.0–v5.7.
+    // Nếu chỉ đổi giá trị mặc định thì config cũ vẫn bật lại 2 thứ đã phá
+    // camera/export. Công tắc mới bắt buộc phải bật tay, nên bản cũ không
+    // thể vô tình kích hoạt.
+    BOOL experimental = [[LPConfig shared] flag:@"experimental" fallback:NO];
+
+    if (experimental && [[LPConfig shared] flag:@"addMicInput" fallback:NO]) {
+        Class cap = NSClassFromString(@"AVCaptureSession");
+        BOOL e = LPHookMethod(cap, @selector(startRunning), (IMP)LPStartRunning, NULL);
+        LPLog(@"[media] mic (thử nghiệm) = %d", e);
+    }
+
+    if (experimental && [[LPConfig shared] flag:@"frameRatioEnabled" fallback:NO]) {
+        BOOL f = LPHookMethodTyped(exp, @selector(exportAsynchronouslyWithCompletionHandler:), "v",
+                                   (IMP)LPExportAsync, NULL);
+        LPLog(@"[media] tỉ lệ khung (thử nghiệm) = %d", f);
+    }
+
+    if (!experimental) {
+        LPLog(@"[media] chế độ AN TOÀN: chỉ trần quay + nâng ngưỡng dung lượng");
+    }
+
+    LPLog(@"[media] trần %.0fs / %.0fMB · upload %.0fs / %.0fMB",
           LPEffectiveRecordSeconds(), LPMaxRecordBytes() / 1048576.0,
-          LPUploadSeconds(), LPUploadBytes() / 1048576.0,
-          [[LPConfig shared] str:@"frameRatioDefault" fallback:@"auto"]);
+          LPUploadSeconds(), LPUploadBytes() / 1048576.0);
 }
