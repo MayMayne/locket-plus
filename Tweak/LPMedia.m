@@ -153,20 +153,43 @@ static void LPStartRunning(id self, SEL _cmd) {
         LPEnsureMicInput(self);
         if ([[LPConfig shared] flag:@"keepAudioSession" fallback:YES]) LPEnsureAudioCategory();
     } @catch (__unused NSException *e) {}
-    gCaptureRunning = YES;
     if (gOrigStartRunning) gOrigStartRunning(self, _cmd);
 }
 
 static void (*gOrigStopRunning)(id, SEL);
 static void LPStopRunning(id self, SEL _cmd) {
     if (gOrigStopRunning) gOrigStopRunning(self, _cmd);
-    gCaptureRunning = NO;
 }
 
-// Giữ audio session sống khi app deactivate nó giữa lúc quay → mất tiếng.
+// Cờ GHI HÌNH thật — chỉ bật giữa startRecording… và stopRecording.
+// Dùng cờ này thay cho "session đang chạy": session chạy không có nghĩa là
+// đang ghi, và giữ audio session sống khi chỉ đang xem trước sẽ bật micro
+// vô ích (đèn cam/mic sáng, nhạc nền bị ngắt).
+static volatile BOOL gRecording = NO;
+static NSTimeInterval gRecordingDeadline = 0;
+
+static void (*gOrigStartRecording)(id, SEL, NSURL *, id);
+static void LPStartRecording(id self, SEL _cmd, NSURL *url, id delegate) {
+    IMP o = LPOrigIMPFor(self, _cmd);
+    if (!o) return;
+    gRecording = YES;
+    gRecordingDeadline = [NSDate timeIntervalSinceReferenceDate] + LPEffectiveRecordSeconds() + 30.0;
+    LPTrace("media.startRecording");
+    ((void (*)(id, SEL, NSURL *, id))o)(self, _cmd, url, delegate);
+}
+
+static void (*gOrigStopRecording)(id, SEL);
+static void LPStopRecording(id self, SEL _cmd) {
+    gRecording = NO;
+    IMP o = LPOrigIMPFor(self, _cmd);
+    if (o) ((void (*)(id, SEL))o)(self, _cmd);
+}
+
+// Giữ audio session sống CHỈ khi đang ghi hình thật.
 static BOOL (*gOrigSetActive)(id, SEL, BOOL, NSUInteger, NSError **);
 static BOOL LPSetActive(id self, SEL _cmd, BOOL active, NSUInteger opts, NSError **err) {
-    if (!active && gCaptureRunning &&
+    if (!active && gRecording &&
+        [NSDate timeIntervalSinceReferenceDate] < gRecordingDeadline &&
         [[LPConfig shared] flag:@"keepAudioSession" fallback:YES]) {
         LPTrace("media.keepAudioSession");
         return YES;
@@ -383,9 +406,12 @@ static void LPAskRatioOnMain(void (^done)(NSString *choice)) {
 // Đó là cách video dài thực sự vừa giới hạn upload, vì fileLengthLimit chỉ là
 // gợi ý — AVFoundation có thể bỏ qua và export ra file to hơn.
 //
-// Hook họ "init" dưới ARC: PHẢI khai báo ns_returns_retained, nếu không ARC
-// chèn objc_autoreleaseReturnValue lên một object +1 → over-release → crash.
-// (Đây là lý do bản v1.x chết; không phải "không được hook init".)
+// Hook họ "init" dưới ARC: PHẢI khai báo ns_returns_retained ở CẢ hàm hook VÀ
+// con trỏ hàm gọi IMP gốc. Nếu thiếu, ARC giả định +0 ở một trong hai phía →
+// over-release (crash) hoặc leak. Đây chính là lỗi làm v1.x chết, không phải
+// "không được hook init".
+typedef id (*LPInitIMP)(id, SEL, id, id) __attribute__((ns_returns_retained));
+
 static NSArray<NSString *> *LPPresetLadder(void) {
     return @[@"AVAssetExportPreset1280x720",
              @"AVAssetExportPreset1920x1080"];
@@ -395,10 +421,14 @@ static NSString *LPChoosePreset(AVAsset *asset, NSString *requested) {
     if (![[LPConfig shared] flag:@"compressShortUploads" fallback:YES]) return requested;
     if (!asset || ![requested isKindOfClass:[NSString class]]) return requested;
 
-    // CHỈ hạ preset cho clip NGẮN (mục tiêu 15MB / 60s ≈ 2 Mbps).
-    // Video quay dài 10 phút có ngân sách 500MB ≈ 6.7 Mbps — 1080p vẫn vừa,
-    // hạ xuống 720p chỉ làm mất chi tiết mà không cần thiết.
     @try {
+        // CHỈ áp cho asset CÓ video track. Export audio/ảnh không được đụng.
+        NSArray *vt = [asset tracksWithMediaType:AVMediaTypeVideo];
+        if (![vt isKindOfClass:[NSArray class]] || !vt.count) return requested;
+
+        // CHỈ hạ preset cho clip NGẮN (mục tiêu 15MB / 60s ≈ 2 Mbps).
+        // Video quay dài 10 phút có ngân sách 500MB ≈ 6.7 Mbps — 1080p vẫn vừa,
+        // hạ xuống 720p chỉ làm mất chi tiết mà không cần thiết.
         double d = CMTimeGetSeconds(asset.duration);
         if (!isfinite(d) || d <= 0) return requested;
         if (d > LPUploadSeconds() + 0.5) return requested;
@@ -427,7 +457,7 @@ static id LPExportInit(id self, SEL _cmd, AVAsset *asset, NSString *preset) {
     IMP o = LPOrigIMPFor(self, _cmd);
     if (!o) return nil;
     NSString *use = LPChoosePreset(asset, preset);
-    return ((id (*)(id, SEL, AVAsset *, NSString *))o)(self, _cmd, asset, use);
+    return ((LPInitIMP)o)(self, _cmd, asset, use);
 }
 
 #pragma mark - AVAssetExportSession
@@ -601,6 +631,14 @@ void LPInstallMedia(void) {
     BOOL d = LPHookMethod(cap, @selector(stopRunning), (IMP)LPStopRunning,
                           (IMP *)&gOrigStopRunning);
     LPLog(@"[media] AVCaptureSession start=%d stop=%d", c, d);
+
+    // Cờ "đang ghi" — hook trên AVCaptureMovieFileOutput, không phải session.
+    Class mfo = NSClassFromString(@"AVCaptureMovieFileOutput");
+    BOOL c2 = LPHookMethod(mfo, @selector(startRecordingToOutputFileURL:recordingDelegate:),
+                           (IMP)LPStartRecording, (IMP *)&gOrigStartRecording);
+    BOOL d2 = LPHookMethod(mfo, @selector(stopRecording), (IMP)LPStopRecording,
+                           (IMP *)&gOrigStopRecording);
+    LPLog(@"[media] ghi hình start=%d stop=%d", c2, d2);
 
     Class sess = NSClassFromString(@"AVAudioSession");
     BOOL e = LPHookMethod(sess, @selector(setActive:withOptions:error:),
