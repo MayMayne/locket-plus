@@ -199,6 +199,47 @@ void LPInstallGoldNetProcessor(void) {
     LPLog(@"[gold] processor đã gắn");
 }
 
+#pragma mark - xoá cache CustomerInfo (chỉ 1 lần)
+
+// RevenueCat lưu CustomerInfo vào NSUserDefaults và CHỈ gọi mạng khi cache cũ.
+// Nếu lần đầu cài bản mod mà cache đang nói "không có Gold", processor JSON
+// không có cơ hội chạy → Gold không mở dù code đúng.
+//
+// Xoá ĐÚNG các key cache, TUYỆT ĐỐI không xoá key appUserID: xoá nó thì
+// RevenueCat sinh anonymous ID mới và mất luôn giao dịch thật đã mua.
+void LPInvalidateRevenueCatCacheOnce(void) {
+    if (![[LPConfig shared] flag:@"goldUnlock" fallback:YES]) return;
+
+    NSString *marker = LPPath(@"rc.cache.cleared");
+    if ([[NSFileManager defaultManager] fileExistsAtPath:marker]) return;
+
+    @try {
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        NSDictionary *all = [ud dictionaryRepresentation];
+        NSMutableArray<NSString *> *victims = [NSMutableArray array];
+
+        for (NSString *k in all.allKeys) {
+            if (![k isKindOfClass:[NSString class]]) continue;
+            NSString *l = k.lowercaseString;
+            if (![l containsString:@"revenuecat"]) continue;
+            // Bảo vệ danh tính người dùng — mất cái này là mất quyền mua thật.
+            if ([l containsString:@"appuserid"] || [l containsString:@"app_user_id"]) continue;
+            if ([l containsString:@"purchaserinfo"] || [l containsString:@"customerinfo"]) {
+                [victims addObject:k];
+            }
+        }
+        for (NSString *k in victims) [ud removeObjectForKey:k];
+        [ud synchronize];
+
+        [@"ok" writeToFile:marker atomically:YES
+                 encoding:NSUTF8StringEncoding error:nil];
+        LPLog(@"[gold] xoá %lu key cache CustomerInfo (giữ appUserID)",
+              (unsigned long)victims.count);
+    } @catch (NSException *e) {
+        LPLog(@"[gold] xoá cache lỗi: %@", e.reason);
+    }
+}
+
 #pragma mark - KHÔNG hook class RevenueCat
 
 // AutoRcSideload (bản chạy được) KHÔNG hook RCEntitlementInfos / RCCustomerInfo.
