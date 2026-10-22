@@ -388,6 +388,11 @@ static UIImage *LPImageNamed(NSString *name) {
 }
 
 - (void)refreshCoverVideo {
+    // reload() gọi hàm này mỗi lần sửa profile → phải bỏ observer cũ trước,
+    // nếu không sẽ có N observer và coverVideoEnded: chạy N lần.
+    [[NSNotificationCenter defaultCenter] removeObserver:self
+                                                    name:AVPlayerItemDidPlayToEndTimeNotification
+                                                  object:nil];
     [self.coverPlayer pause];
     [self.coverLayer removeFromSuperlayer];
     self.coverPlayer = nil;
