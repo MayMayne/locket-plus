@@ -12,6 +12,9 @@
 
 static NSArray<NSString *> *gLPNotesPresets;
 
+// Dùng ở thanh bàn phím (định nghĩa ở cuối file).
+static NSArray<NSString *> *LPNotesSample(NSArray<NSString *> *src, NSUInteger n);
+
 // Danh sách câu mẫu, chia nhóm theo giọng điệu. Mỗi câu < 60 ký tự, emoji vừa phải.
 NSArray<NSString *> *LPNotesPresets(void) {
     static dispatch_once_t once;

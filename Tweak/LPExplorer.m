@@ -153,15 +153,6 @@ static UIViewController *LPResolveExplorerHost(UIViewController *host) {
     return w.rootViewController;
 }
 
-void LPOpenExplorer(UIViewController *host) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *vc = LPResolveExplorerHost(host);
-        while (vc.presentedViewController) vc = vc.presentedViewController;
-        LPExplorerViewController *e = [LPExplorerViewController new];
-        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:e];
-        [vc presentViewController:nav animated:YES completion:nil];
-    });
-}
 
 #pragma mark - menu tổng
 
