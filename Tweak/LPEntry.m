@@ -65,7 +65,6 @@ static void LPStep(const char *name) {
 static void LPBoot(void) {
     if (gBooted) return;
     gBooted = YES;
-    LPInstallCrashHandler();
 
     // CHẾ ĐỘ AN TOÀN: nếu app từng crash, lần mở sau không hook gì cả.
     // Tắt bằng cách sửa "safeMode" = false trong Documents/LocketPlus/config.plist.
@@ -100,14 +99,18 @@ static void LPBoot(void) {
     // 8 giây sau mà app còn sống → boot thành công, lần sau không bật safeMode.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ LPMarkBootOK(); });
-    LPLog(@"[boot] Locket+ v1.11 sẵn sàng (không menu)");
+    LPLog(@"[boot] Locket+ v1.12 sẵn sàng (không menu)");
 }
 
 __attribute__((constructor))
 static void LPInit(void) {
     // TUYỆT ĐỐI không đụng UIKit ở đây: dylib nạp trước khi UIApplication tồn tại.
     @autoreleasepool {
-        // Phải chạy TRƯỚC main(): app đụng app-group + keychain ngay màn hình đầu.
+        // Bắt crash TRƯỚC TIÊN — nếu không, crash trong constructor sẽ không
+        // được ghi lại và ta chỉ thấy log cụt 1 dòng.
+        @try { LPInstallCrashHandler(); } @catch (__unused NSException *e) {}
+
+        // Phải chạy TRƯỚC main(): app đụng app-group ngay màn hình đầu.
         @try { LPInstallSideloadFixes(); } @catch (__unused NSException *e) {}
 
         [[NSNotificationCenter defaultCenter]

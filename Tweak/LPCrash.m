@@ -87,6 +87,24 @@ void LPInstallCrashHandler(void) {
         NSLog(@"[Locket+] lần trước chết ở bước: %@", last);
     }
 
+    // Đếm số lần chết liên tiếp. >=2 → lần sau không hook gì (cứu hộ khẩn cấp),
+    // để app LUÔN mở được dù tweak có lỗi gì.
+    NSString *countPath = LPPath(@"crash.count");
+    int crashes = [[NSString stringWithContentsOfFile:countPath
+                                            encoding:NSUTF8StringEncoding error:nil] intValue];
+    if (hadTrace && !hadOk) {
+        crashes++;
+        [[NSString stringWithFormat:@"%d", crashes]
+            writeToFile:countPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        if (crashes >= 2) {
+            NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:[LPConfig path:@"config.plist"]] mutableCopy]
+                                     ?: [NSMutableDictionary dictionary];
+            d[@"safeMode"] = @YES;
+            [d writeToFile:[LPConfig path:@"config.plist"] atomically:YES];
+            NSLog(@"[Locket+] chết %d lần liên tiếp → khoá hook (safeMode)", crashes);
+        }
+    }
+
     // Bắt đầu lượt mới: xoá mốc, ghi trace trống.
     [fm removeItemAtPath:okPath error:nil];
     [fm removeItemAtPath:tracePath error:nil];
@@ -104,4 +122,6 @@ void LPMarkBootOK(void) {
     [[NSFileManager defaultManager] createDirectoryAtPath:LPDir()
                               withIntermediateDirectories:YES attributes:nil error:nil];
     [@"ok" writeToFile:LPPath(@"boot.ok") atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    // Boot sống 8 giây → reset bộ đếm crash.
+    [[NSFileManager defaultManager] removeItemAtPath:LPPath(@"crash.count") error:nil];
 }
