@@ -11,7 +11,7 @@ Tweak/LPCommon.m:277:5: note: block will be retained by the captured object
 ==> build/LocketPlus.dylib
 Non-fat file: build/LocketPlus.dylib is architecture: arm64
 Executable=/Users/runner/work/locket-plus/locket-plus/build/LocketPlus.dylib
-Identifier=LocketPlus-55554944e9f366b84a983c108f299260fc78051a
+Identifier=LocketPlus-555549441a30c30ef0a630adb4b99247893f5d5a
 Format=Mach-O thin (arm64)
 exit=0
 
