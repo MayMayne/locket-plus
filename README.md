@@ -1,71 +1,84 @@
-# LocketPlus (`LocketPlus.dylib`)
+# LocketPlus (`LocketPlus.dylib`) v2.0
 
-Dự án tweak Objective-C tự đóng gói cho **Locket 2.68+**, gồm 4 khối:
+Một dylib duy nhất cho **Locket 2.68+**, viết lại từ đầu sau khi disassemble 3 dylib mẫu
+(`blatantsPatch`, `AutoRcSideload`, `MHVideoPipeline`).
 
-| Tệp | Chức năng |
-|---|---|
-| `Tweak/LPMedia.m` | Phá trần quay phim: `maxRecordedDuration` → **600s**, `maxRecordedFileSize` → **500MB**, mở lại `AVAssetExportSession.timeRange`, báo thời lượng/dung lượng đã thu gọn để qua validator client |
-| `Tweak/LPFriend.m` | Chẩn đoán kết bạn (móc `NSURLSession` + `GTMSessionFetcher`), khi bị **401/403** tự ép làm mới `FIRAuth` ID token + `FIRAppCheck` token rồi **replay 1 lần** |
-| `Tweak/LPProfile.m` | Trang **Profile+** riêng: ảnh bìa, ảnh đại diện, quote, bài hát + ca sĩ + lyric, bộ sưu tập ảnh tiêu biểu, danh sách bạn thân kèm **huy hiệu bạn thân** vàng |
-| `Tweak/LPExplorer.m` + `LPPatch.m` | **Runtime Explorer** tìm class/method ngay trên máy + bộ vá cấu hình trong `Documents/LocketPlus/config.plist` (không cần build lại khi Locket đổi tên hàm) |
-| `Tweak/LPEntry.m` | Nút nổi **L+** (chạm = mở hub, giữ = chẩn đoán kết bạn) + tự gắn nút ✨ vào `ProfileMenuV2ViewController` |
+## Ba việc nó làm
 
----
-
-## Sự thật kỹ thuật (đã kiểm chứng trên binary 2.68 + dylib mẫu)
-
-### 1. Kết bạn trên IPA sideload — **không phá được ở client**
-- `sendFriendRequest` / `acceptFriendRequest` là Cloud Function (project `locket-4252a`), server kiểm `X-Firebase-AppCheck`.
-- Bản ký lại bằng chứng chỉ khác **không tạo được attestation hợp lệ** cho team `SWD4AZY4KG`. Refresh token không tạo ra attestation.
-- `MHProfileSupport.dylib` (bản V28) làm đúng một việc: **ép refresh ID token + App Check token khi gặp 401 rồi replay** — chỉ cứu được trường hợp token cũ/hỏng (keychain đứt khi sideload), không cứu được 403 App Check.
-- `LocketPlus` làm điều tương tự nhưng có log rõ ràng, và **phân biệt 401 vs 403**:
-  - `401` → tự refresh ID token + replay 1 lần (có thể cứu).
-  - `403` → log thẳng: App Check, bản sideload thua.
-- Đường duy nhất còn lại: cài bằng **TrollStore / jailbreak giữ nguyên chữ ký gốc**, hoặc để **người dùng bản App Store gốc** bấm accept link mời của bạn.
-
-### 2. Video 10 phút / 500MB — client thì phá được, server thì không
-- Đã nới: `AVCaptureMovieFileOutput.maxRecordedDuration / maxRecordedFileSize`, `AVAssetExportSession.timeRange / fileLengthLimit`, `UIImagePickerController.videoMaximumDuration`.
-- **Chọn video từ thư viện (PHPicker) không có setter để hook** — Locket 2.68 dùng PHPicker, nên "chọn video 10 phút" vẫn bị app kiểm duration/size sau khi load. Muốn phá phải dùng Runtime Explorer tìm hàm kiểm tra rồi thêm vào `patches`.
-- **Upload vẫn bị server chặn**: Storage rules + Cloud Function kiểm duration/size. Hook client chỉ giúp quay/chọn được, không giúp upload được.
-- Nút quay có progress ring do ViewModel Swift đếm — giữ tay 10 phút có thể bị UI tự ngắt dù trần đã nới.
-
-### 3. Trang Profile+ (ảnh bìa, avatar, quote, nhạc + lyric, ảnh tiêu biểu, bạn thân + huy hiệu)
-- Hoàn toàn **cục bộ** (`Documents/LocketPlus/`). Server Locket không có trường cho các mục này nên người khác không thấy.
-
----
-
-## Những lỗi đã sửa ở v1.3 (bản cũ crash ngay khi mở app)
-
-| Lỗi | Hậu quả | Sửa |
+| Việc | Cách làm | Có thật sự được không |
 |---|---|---|
-| Hook `-[GTMSessionFetcher startWithCompletionHandler:]` rồi KVC `request`/`response` | Class không có property đó → **NSException mỗi request** → app chết | Bỏ; hook `NSURLSession` và chỉ bọc request kết bạn |
-| Hook `-[AVAsset duration]` | Nổ ngay khi đọc duration video | Bỏ (getter này cũng không chặn được gì) |
-| Hook `-[NSFileManager attributesOfItemAtPath:error:]` | Chạy liên tục, ghi đè `NSFileSize` làm đọc file lỗi | Bỏ |
-| Hook `viewDidAppear:` của class Swift trong constructor | Class chưa tồn tại → hook không bao giờ gắn | `LPWhenClassReady` chờ class rồi mới hook |
-| `patches` trong config bị đánh dấu "đã xử lý" khi class chưa có | Patch im lặng không có tác dụng | Chỉ đánh dấu sau khi hook thành công |
-| `LPHook` ghi IMP gốc của chính mình khi hook lặp | Hook chồng hook → đệ quy | `LPHookMethod` kiểm tra trùng |
+| **Sống sót sideload** (không màn đen, không hỏng đăng nhập) | Canary keychain → đọc access group THẬT → fishhook `SecItem*` để THAY group (không xoá) + swizzle `containerURLForSecurityApplicationGroupIdentifier:` | ✅ Chắc chắn — đây đúng là cách `blatantsPatch` làm |
+| **Quay 10 phút / 500MB** | `AVCaptureMovieFileOutput.setMaxRecordedDuration/FileSize` → 600s / 500MB; `AVAssetExportSession.setFileLengthLimit` → 500MB; `setCanPerformMultiplePassesOverSourceMediaData` → YES; preset ladder HighestQuality→1920x1080→1280x720→Medium | ✅ Phía client. Upload vẫn phải qua Storage rules của Locket |
+| **Mở khoá Gold** | Rewrite JSON response của `api.revenuecat.com/v1/subscribers/*` (thêm entitlement + subscription còn hạn) → SDK tự parse ra CustomerInfo có Gold; + nhân bản entitlement key; + `activeSubscriptions` | ⚠️ **Client-side.** UI/gate của app mở. Badge trên máy người khác KHÔNG hiện (server không biết) |
+| **Kết bạn** | Chẩn đoán: bắt request `sendFriendRequest`/`acceptFriendRequest`, log HTTP status + body; 401 → refresh ID token + App Check rồi replay 1 lần; mở hạn mức bạn bè qua Remote Config | ⚠️ 401 cứu được. **403 (App Check) thì không** — xem dưới |
 
-## Cách build `LocketPlus.dylib`
+## Sự thật về kết bạn (đã kiểm chứng nhiều lần)
 
-### Cách A — GitHub Actions (không cần máy Mac)
-1. Đẩy thư mục này lên một repo GitHub.
-2. Vào tab **Actions → Build LocketPlus.dylib → Run workflow**.
-3. Tải artifact **`LocketPlus.dylib`**.
+`sendFriendRequest` / `acceptFriendRequest` là Cloud Functions (project `locket-4252a`).
+Server kiểm `X-Firebase-AppCheck`. Bản ký lại bằng chứng chỉ khác **không tạo được
+attestation hợp lệ** cho team `SWD4AZY4KG`. Refresh token không tạo ra attestation.
 
-### Cách B — Máy Mac có Xcode
+- **401** (token cũ/hỏng do keychain đứt khi sideload) → refresh + replay **cứu được**.
+- **403** (App Check từ chối) → **không cứu được ở client**.
+- **Hạn mức bạn bè** (`max_friends_count`, `friend_limit_mode`...) là gate **client** đọc
+  từ Remote Config → dylib mở được. Nếu bạn bị chặn vì "You already have N friends"
+  thì sẽ hết chặn.
+
+Đường còn lại cho 403: cài bằng **TrollStore / jailbreak giữ chữ ký gốc**, hoặc để người
+dùng bản App Store gốc bấm accept link mời.
+
+## Cấu hình
+
+`Documents/LocketPlus/config.plist` (tự tạo lần đầu chạy):
+
+| Key | Mặc định | Ý nghĩa |
+|---|---|---|
+| `maxVideoSeconds` | 600 | Trần thời lượng quay |
+| `maxVideoBytes` | 524288000 | Trần dung lượng (500MB) |
+| `goldUnlock` | true | Bật/tắt mở Gold |
+| `friendLimitUnlock` | true | Mở hạn mức bạn bè (Remote Config) |
+| `friendDiagnostics` | true | Ghi `friend.log` |
+| `autoRefreshOnAuthFail` | true | 401 → refresh + replay |
+| `keepMicOnRecord` | true | Giữ audio session để video có tiếng |
+| `addMicInput` | true | Thêm micro vào AVCaptureSession nếu thiếu |
+| `expandExportRange` | **false** | Nới `AVAssetExportSession.timeRange` (phá trim của user — chỉ bật nếu biết mình làm gì) |
+| `safeMode` | false | Tắt toàn bộ hook (cứu hộ) |
+
+## Chẩn đoán
+
+`Documents/LocketPlus/`:
+- `log.txt` — log chung (tự xoá khi > 512KB)
+- `friend.log` — kết quả chẩn đoán kết bạn
+- `boot.trace` — các bước boot (nếu app chết giữa chừng, đọc file này)
+- `crash.txt` — crash gần nhất + bước cuối
+- `crash.count` — số lần chết liên tiếp; >= 2 → tự bật `safeMode`
+
+## Build
+
+GitHub Actions (`.github/workflows/build-dylib.yml`) — mỗi push lên `main` build và
+release `LocketPlus.dylib` arm64 đã ký ad-hoc.
+
+Hoặc trên máy Mac có Xcode: `./build.sh` → `build/LocketPlus.dylib`.
+
+## Nhúng vào IPA
+
 ```sh
-chmod +x build.sh
-./build.sh
-# -> build/LocketPlus.dylib
+cp LocketPlus.dylib Payload/Locket.app/Frameworks/
+python3 tools/inject.py Payload/Locket.app LocketPlus.dylib   # cần: pip install lief
+# hoặc: optool install -c load -p "@executable_path/Frameworks/LocketPlus.dylib" -t Payload/Locket.app/Locket
 ```
 
----
+Xoá `blatantsPatch.dylib`, `AutoRcSideload.dylib` cũ nếu có — chúng hook trùng.
 
-## Cách tiêm vào IPA
+## Những gì đã bị bỏ so với v1.x (và vì sao)
 
-- **Bằng Cyan / ESign / Feather / Sideloadly**: chọn IPA Locket → mục *Inject dylib* → thêm `LocketPlus.dylib` → ký và cài.
-- **Bằng script đi kèm** (`pip install lief`):
-  ```sh
-  python3 tools/inject.py --ipa Locket.ipa Locket-Plus.ipa build/LocketPlus.dylib
-  ```
-  Sau đó cài `Locket-Plus.ipa` qua TrollStore hoặc ký bằng Sideloadly/SideStore.
+| Bỏ | Lý do |
+|---|---|
+| `LPProfile.m` (Profile+ UI) | Dựng lại cây view profile của app → `unrecognized selector` khi Locket đổi layout. Đây là nguồn crash lớn nhất |
+| `LPNotes.m` (ghi chú genz) | 456 dòng UI, không liên quan 3 mục tiêu |
+| `LPExplorer.m` / `LPPatch.m` | Hook class theo tên đoán → im lặng hoặc crash |
+| `LPExport.m` | Trùng hook với `LPMedia` → đệ quy |
+| Hook `RCEntitlementInfos.all/.active` trả NSDictionary | Value thật là **object** `RCEntitlementInfo`, không phải dict → `unrecognized selector` → crash ngay khi mở app (lỗi v1.4–v1.11) |
+| `MSHookFunction` cho `SecItem*` | Vá mã máy trong dyld shared cache → iOS 15+ giết process trong constructor (lỗi v1.12) |
+| `CFDictionaryRemoveValue(query, kSecAttrAccessGroup)` | Xoá group → Firebase Auth mất phiên → màn đen + quay mãi ở login (lỗi v1.12/v1.13) |
+| Hook `-[AVAsset duration]`, `-[NSFileManager attributesOfItemAtPath:]` | Getter trả struct / chạy hàng nghìn lần → crash hoặc làm hỏng đọc file |
