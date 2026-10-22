@@ -177,6 +177,18 @@ void LPShowHub(UIViewController *host) {
             [a addAction:[UIAlertAction actionWithTitle:t style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) { h(); }]];
         };
         add(@"👤 Mở Profile+", ^{ LPOpenProfile(vc); });
+        add(@"💛 Kiểm tra Gold (client)", ^{
+            NSMutableString *o = [NSMutableString string];
+            Class rc = NSClassFromString(@"RCCustomerInfo");
+            Class rv = NSClassFromString(@"FIRRemoteConfigValue");
+            [o appendFormat:@"RCCustomerInfo: %@\nFIRRemoteConfigValue: %@\n",
+                rc ? @"có" : @"KHÔNG", rv ? @"có" : @"KHÔNG"];
+            [o appendString:@"\nGold ở đây là client-side. Server vẫn coi là free:\n"];
+            [o appendString:@"- badge không hiện với người khác\n"];
+            [o appendString:@"- hạn mức kết bạn phía server không đổi\n"];
+            [o appendString:@"\nXem log để biết đã hook những class nào."];
+            LPShowText(vc, @"Gold", o);
+        });
         add(@"🔍 Chẩn đoán kết bạn", ^{ LPRunFriendProbe(vc); });
         add(@"🧭 Runtime Explorer", ^{ LPOpenExplorer(vc); });
         add(@"📄 Xem log", ^{ LPShowText(nil, @"Locket+ log", [LPConfig logText]); });

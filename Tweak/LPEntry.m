@@ -104,6 +104,7 @@ static void LPBoot(void) {
     gBooted = YES;
     LPInstallCrashHandler();
     @try { LPInstallMediaHooks(); } @catch (NSException *e) { LPLog(@"[boot] media lỗi: %@", e); }
+    @try { LPInstallGoldUnlock(); } @catch (NSException *e) { LPLog(@"[boot] gold lỗi: %@", e); }
     @try { LPInstallFriendTools(); } @catch (NSException *e) { LPLog(@"[boot] friend lỗi: %@", e); }
     @try { LPApplyConfiguredPatches(); } @catch (NSException *e) { LPLog(@"[boot] patch lỗi: %@", e); }
     @try { LPInstallProfileHook(); } @catch (NSException *e) { LPLog(@"[boot] profile lỗi: %@", e); }

@@ -29,6 +29,7 @@ void LPInstallFriendTools(void);
 void LPInstallProfileUI(void);
 void LPInstallProfileButton(UIViewController *vc);
 void LPInstallExplorer(void);
+void LPInstallGoldUnlock(void);
 void LPApplyConfiguredPatches(void);
 void LPReapplyPatches(void);
 
