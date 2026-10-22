@@ -78,16 +78,24 @@ static BOOL LPIsFriendLimitKey(NSString *k) {
            [l containsString:@"count"] || [l containsString:@"threshold"];
 }
 
+// friend_limit_mode là ENUM dạng chuỗi ("soft"/"hard"/"unlimited"), không phải
+// số. Trả "999999" cho nó là sai kiểu → app parse fail. Phải trả "unlimited".
+static BOOL LPIsFriendModeKey(NSString *k) {
+    NSString *l = k.lowercaseString;
+    return [l containsString:@"friend"] && [l containsString:@"mode"];
+}
+
 // Key bật tính năng Gold → trả YES.
+// CẨN THẬN: đây là hook boolValue của TOÀN BỘ Remote Config, nên từ khoá phải
+// đủ hẹp. "pro_" từng khớp cả "production" → sẽ lật cờ môi trường. Bỏ.
 static BOOL LPIsGoldFlagKey(NSString *k) {
     NSString *l = k.lowercaseString;
     static NSArray *words;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        words = @[@"gold", @"premium", @"pro_", @"subscri", @"entitlement",
-                  @"camera_theme", @"theme_", @"badge", @"remove_ads",
-                  @"streak_recovery", @"priority_support", @"longer_video",
-                  @"unlimited"];
+        words = @[@"gold", @"premium", @"camera_theme", @"theme_gold",
+                  @"badge", @"remove_ads", @"streak_recovery",
+                  @"priority_support", @"longer_video", @"unlimited_friend"];
     });
     for (NSString *w in words) if ([l containsString:w]) return YES;
     return NO;
@@ -167,8 +175,11 @@ static NSString *LPString(id self, SEL _cmd) {
     @try {
         NSString *k = LPRCKey(self);
         if (!k.length) return real;
+        if (LPIsFriendModeKey(k) && [[LPConfig shared] flag:@"friendLimitUnlock" fallback:YES]) {
+            return @"unlimited";
+        }
         if (LPIsFriendLimitKey(k) && [[LPConfig shared] flag:@"friendLimitUnlock" fallback:YES]) {
-            return @"999999";       // "unlimited" cũng dùng, nhưng số an toàn hơn
+            return @"999999";
         }
         if (LPIsVideoDurationKey(k)) {
             return [NSString stringWithFormat:@"%.0f", LPVideoSeconds()];

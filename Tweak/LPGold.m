@@ -199,38 +199,115 @@ void LPInstallGoldNetProcessor(void) {
     LPLog(@"[gold] processor đã gắn");
 }
 
-#pragma mark - fallback: chỉ activeSubscriptions (an toàn kiểu)
+#pragma mark - fallback: nhân bản entitlement key (an toàn kiểu)
 
-// KHÔNG hook RCEntitlementInfos.all / .active.
-// Lý do: chúng trả NSDictionary<NSString*, RCEntitlementInfo> — VALUE là OBJECT
-// của class RCEntitlementInfo, không phải dictionary. Nhét dictionary vào là
-// app gọi .isActive lên NSDictionary → unrecognized selector → crash ngay khi
-// mở app. Đây đúng là lỗi của v1.4–v1.11.
+// VẤN ĐỀ: không biết chắc Locket đọc entitlement ID nào
+// ("Gold"? "gold"? "locket_gold"? "premium"?).
 //
-// Cách duy nhất an toàn là để RevenueCat SDK tự parse JSON đã vá (processor ở
-// trên) — nó tạo ra RCEntitlementInfo THẬT, đúng class, đúng thuộc tính.
+// KHÔNG THỂ bịa RCEntitlementInfo — đó là class thật, nhét NSDictionary vào là
+// crash "unrecognized selector" (đúng lỗi v1.4–v1.11).
 //
-// activeSubscriptions thì trả NSSet<NSString*> → thêm chuỗi vào là an toàn,
-// nên giữ lại làm lưới hứng khi response đến từ cache.
+// CÁCH ĐÚNG: lấy object RCEntitlementInfo THẬT (do SDK parse từ JSON đã vá) rồi
+// NHÂN BẢN nó dưới nhiều key khác nhau. Value vẫn là object đúng class →
+// app gọi .isActive / .identifier / .expirationDate đều chạy bình thường.
+// Không crash được, và phủ hết mọi tên key khả dĩ.
 
+static NSArray<NSString *> *LPCandidateEntitlementKeys(void) {
+    return @[@"Gold", @"gold", @"Gold ", @"Locket Gold", @"LocketGold",
+             @"locket_gold", @"locket_gold_annual", @"locket_gold_monthly",
+             @"premium", @"Premium", @"pro", @"Pro", @"plus", @"Plus",
+             @"locket_plus", @"unlimited", @"subscription", @"vip", @"VIP"];
+}
+
+// Nhân bản entry "gold-ish" (hoặc entry đầu tiên) dưới mọi key khả dĩ.
+static NSDictionary *LPExpandEntitlements(NSDictionary *real) {
+    if (![real isKindOfClass:[NSDictionary class]] || !real.count) return real;
+
+    // Tìm entry đáng nhân bản: ưu tiên key chứa gold/premium/pro.
+    id donor = nil;
+    for (NSString *k in real.allKeys) {
+        if (![k isKindOfClass:[NSString class]]) continue;
+        NSString *lk = k.lowercaseString;
+        if ([lk containsString:@"gold"] || [lk containsString:@"premium"] ||
+            [lk containsString:@"pro"] || [lk containsString:@"plus"]) {
+            donor = real[k];
+            break;
+        }
+    }
+    if (!donor) donor = real[real.allKeys.firstObject];
+    if (!donor) return real;
+
+    NSMutableDictionary *out = [real mutableCopy];
+    for (NSString *k in LPCandidateEntitlementKeys()) {
+        if (!out[k]) out[k] = donor;      // cùng object, đúng class
+    }
+    return out;
+}
+
+static NSDictionary *(*gOrigEntAll)(id, SEL);
+static NSDictionary *LPEntAll(id self, SEL _cmd) {
+    NSDictionary *real = gOrigEntAll ? gOrigEntAll(self, _cmd) : nil;
+    if (![[LPConfig shared] flag:@"goldUnlock" fallback:YES]) return real;
+    @try { return LPExpandEntitlements(real); }
+    @catch (__unused NSException *e) { return real; }
+}
+
+static NSDictionary *(*gOrigEntActive)(id, SEL);
+static NSDictionary *LPEntActive(id self, SEL _cmd) {
+    NSDictionary *real = gOrigEntActive ? gOrigEntActive(self, _cmd) : nil;
+    if (![[LPConfig shared] flag:@"goldUnlock" fallback:YES]) return real;
+    @try {
+        NSDictionary *out = LPExpandEntitlements(real);
+        if ((!out || !out.count) && real) {
+            LPLog(@"[gold] entitlements.active rỗng — JSON chưa được vá "
+                  @"(có thể RevenueCat trả 304 từ cache)");
+        }
+        return out;
+    } @catch (__unused NSException *e) { return real; }
+}
+
+// activeSubscriptions trả NSSet<NSString*> → thêm chuỗi vào là an toàn.
 static id (*gOrigActiveSubs)(id, SEL);
 static id LPActiveSubs(id self, SEL _cmd) {
     id real = gOrigActiveSubs ? gOrigActiveSubs(self, _cmd) : nil;
+    if (![[LPConfig shared] flag:@"goldUnlock" fallback:YES]) return real;
     NSMutableSet *s = [real isKindOfClass:[NSSet class]] ? [real mutableCopy] : [NSMutableSet set];
     [s addObject:@"locket_gold_annual"];
     return s;
 }
 
+static void LPInstallGoldClassHooks(void) {
+    Class ent = NSClassFromString(@"RCEntitlementInfos");
+    if (ent) {
+        LPHookMethodTyped(ent, @selector(all),    "@", (IMP)LPEntAll,    (IMP *)&gOrigEntAll);
+        LPHookMethodTyped(ent, @selector(active), "@", (IMP)LPEntActive, (IMP *)&gOrigEntActive);
+        LPLog(@"[gold] hook RCEntitlementInfos.all/.active (nhân bản key)");
+    }
+    Class ci = NSClassFromString(@"RCCustomerInfo");
+    if (ci) {
+        LPHookMethodTyped(ci, @selector(activeSubscriptions), "@",
+                          (IMP)LPActiveSubs, (IMP *)&gOrigActiveSubs);
+        LPLog(@"[gold] hook RCCustomerInfo.activeSubscriptions");
+    }
+}
+
 void LPInstallGoldHooks(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        Class ci = NSClassFromString(@"RCCustomerInfo");
-        if (ci) {
-            if (LPHookMethodTyped(ci, @selector(activeSubscriptions), "@",
-                                  (IMP)LPActiveSubs, (IMP *)&gOrigActiveSubs)) {
-                LPLog(@"[gold] hook RCCustomerInfo.activeSubscriptions (NSSet)");
-            }
+        LPInstallGoldClassHooks();
+        // RevenueCat nạp muộn → thử lại vài lần.
+        for (int i = 1; i <= 6; i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 1.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                static BOOL retried = NO;
+                if (retried) return;
+                if (!NSClassFromString(@"RCEntitlementInfos") &&
+                    !NSClassFromString(@"RCCustomerInfo")) return;
+                retried = YES;
+                LPInstallGoldClassHooks();
+                LPLog(@"[gold] hook muộn OK");
+            });
         }
-        LPLog(@"[gold] xong — Gold đến từ processor JSON, không hook entitlements");
+        LPLog(@"[gold] xong");
     });
 }
