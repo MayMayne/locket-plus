@@ -1,13 +1,11 @@
 # build
 
 ```
-ld: warning: Could not find or use auto-linked framework 'CoreAudioTypes': framework 'CoreAudioTypes' not found
-ld: warning: Could not find or use auto-linked framework 'UIUtilities': framework 'UIUtilities' not found
-Undefined symbols for architecture arm64:
-  "_LPInvalidateRevenueCatCacheOnce", referenced from:
-      ___LPInit_block_invoke_2 in LPEntry-bc0ac5.o
-ld: symbol(s) not found for architecture arm64
-clang: error: linker command failed with exit code 1 (use -v to see invocation)
-exit=1
+==> build/LocketPlus.dylib
+Non-fat file: build/LocketPlus.dylib is architecture: arm64
+Executable=/Users/runner/work/locket-plus/locket-plus/build/LocketPlus.dylib
+Identifier=LocketPlus-555549447d143763d2403114b4cee24a0447b671
+Format=Mach-O thin (arm64)
+exit=0
 
 ```
