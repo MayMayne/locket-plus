@@ -25,6 +25,7 @@
 - (BOOL)flag:(NSString *)key fallback:(BOOL)fb;
 - (double)dbl:(NSString *)key fallback:(double)fb;
 - (NSString *)str:(NSString *)key fallback:(NSString *)fb;
+- (id)obj:(NSString *)key;
 + (NSString *)dir;
 + (NSString *)path:(NSString *)name;
 + (void)log:(NSString *)fmt, ...;

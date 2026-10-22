@@ -64,6 +64,10 @@ static LPConfig *gConfig;
     return [v isKindOfClass:[NSString class]] ? v : fb;
 }
 
+- (id)obj:(NSString *)key {
+    return key ? self.plist[key] : nil;
+}
+
 // Ghi log thread-safe. Hook chạy trên network/main/capture thread cùng lúc —
 // ghi file không khoá là crash (đúng lỗi đã gặp ở v1.13).
 + (void)log:(NSString *)fmt, ... {
@@ -276,20 +280,26 @@ void LPWhenClassReady(NSString *className, void (^block)(Class cls)) {
     Class c = NSClassFromString(className);
     if (c) { block(c); return; }
 
-    __block int tries = 0;
-    __block void (^retry)(void) = nil;
-    retry = ^{
-        Class cls = NSClassFromString(className);
-        if (cls) { block(cls); return; }
-        if (++tries > 60) {          // 60 × 0.5s = 30s
-            LPLog(@"[hook] không thấy class %@", className);
-            return;
-        }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), retry);
-    };
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), retry);
+    // KHÔNG đệ quy: đặt sẵn N lần kiểm tra. Cách cũ (block tự gọi lại chính nó)
+    // tạo retain cycle trong ARC vì __block object bị retain khi capture →
+    // rò rỉ vĩnh viễn mỗi lần chờ một class không tồn tại.
+    //
+    // __block BOOL là kiểu nguyên thuỷ → block không retain gì → không cycle.
+    __block BOOL done = NO;
+    const int kTries = 60;                    // 60 × 0.5s = 30s
+    for (int i = 1; i <= kTries; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (done) return;
+            Class cls = NSClassFromString(className);
+            if (!cls) {
+                if (i == kTries) LPLog(@"[hook] không thấy class %@", className);
+                return;
+            }
+            done = YES;
+            block(cls);
+        });
+    }
 }
 
 #pragma mark - tầng mạng dùng chung
