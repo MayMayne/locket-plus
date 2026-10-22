@@ -1,14 +1,29 @@
 // ============================================================================
-//  LPMedia.m — trần quay 600s / 500MB
+//  LPMedia.m — trần quay 600s / 500MB + nén khi cần
 //
-//  BÁM SÁT MHVideoPipeline.dylib (đã disassemble):
-//    • Hook -[AVCaptureMovieFileOutput setMaxRecordedDuration:] và
-//      setMaxRecordedFileSize: → ép về 600s / 500MB.
-//    • Hook -[AVAssetExportSession setFileLengthLimit:] / setTimeRange: →
-//      nới trần export (đây là chỗ Locket tự cắt video trước khi upload).
-//    • setCanPerformMultiplePassesOverSourceMediaData = YES → export video dài
-//      không fail giữa đường.
-//    • Preset ladder: HighestQuality → 1920x1080 → 1280x720 → Medium.
+//  ĐÃ ĐỌC LẠI ASSEMBLY của MHVideoPipeline.dylib. Bản trước tôi ghi SAI 3 chỗ
+//  trong comment và trong README — sửa lại cho đúng sự thật:
+//
+//  SỰ THẬT về MHVideoPipeline (bằng chứng ở từng địa chỉ):
+//    • Nó hook -[AVAssetExportSession initWithAsset:presetName:]  (_ExportInit @0x8420)
+//      KHÔNG hook setMaxRecordedDuration/FileSize → nó KHÔNG đụng trần quay.
+//    • Preset ladder HẠ CẤP, thứ tự thật: 1280x720 TRƯỚC, rồi 1920x1080,
+//      không có cả hai thì giữ preset gốc. (0x8558, 0x8590, 0x85c0)
+//    • _Configure (@0x8d88) set:
+//          setFileLengthLimit: 0x600000 = 6 MB     (KHÔNG phải 500MB)
+//          setShouldOptimizeForNetworkUse: YES
+//          setCanPerformMultiplePassesOverSourceMediaData: NO  (KHÔNG phải YES)
+//    • Hằng 0x17c88 = 600 KHÔNG phải "600 giây" — đó là timescale của
+//      kCMTimeZero (value=0, timescale=600, flags=1). Nó dùng cho
+//      setTransform:atTime: trong _FitComposition, không liên quan thời lượng.
+//
+//  => Dylib mẫu là tweak NÉN video cho vừa giới hạn upload, không phải tweak
+//     nâng giới hạn. Đó mới là cách video dài thực sự upload được.
+//
+//  LocketPlus làm CẢ HAI, tách bằng config:
+//    • Mặc định: nâng trần quay lên 600s/500MB (yêu cầu của người dùng).
+//    • compressForUpload=true: theo đúng chiến lược dylib mẫu — hạ preset +
+//      ép fileLengthLimit về uploadTargetBytes (mặc định 6MB).
 //
 //  TUYỆT ĐỐI KHÔNG hook getter trả struct (CMTime, CMTimeRange, CGRect...).
 //  Trên arm64 struct > 16 byte trả qua con trỏ ẩn ở x8 — khai báo sai chữ ký
@@ -45,6 +60,106 @@ static void LPMaxFileSize(id self, SEL _cmd, long long size) {
     IMP o = LPOrigIMPFor(self, _cmd);
     if (!o) return;
     ((void (*)(id, SEL, long long))o)(self, _cmd, want);
+}
+
+#pragma mark - preset ladder (bám sát MHVideoPipeline._ExportInit)
+
+// ĐỌC LẠI ASSEMBLY CHO ĐÚNG — bản trước tôi ghi sai trong README:
+//
+//   _ExportInit được hook vào -[AVAssetExportSession initWithAsset:presetName:].
+//   Nó gọi +exportPresetsCompatibleWithAsset: rồi kiểm theo ĐÚNG thứ tự này:
+//       1. containsObject:@"AVAssetExportPreset1280x720"   → dùng 1280x720
+//       2. containsObject:@"AVAssetExportPreset1920x1080"  → dùng 1920x1080
+//       3. không có cả hai                                  → giữ preset gốc
+//
+//   Tức đây là ladder HẠ CẤP (ưu tiên 720p trước), để file nhỏ.
+//   KHÔNG phải "HighestQuality → 1080p → 720p" như tôi viết nhầm.
+//
+//   _Configure sau đó set:
+//       setFileLengthLimit: 0x600000  = 6 MB   (KHÔNG phải 500MB)
+//       setShouldOptimizeForNetworkUse: YES
+//       setCanPerformMultiplePassesOverSourceMediaData: NO  (KHÔNG phải YES)
+//
+//   => Dylib mẫu KHÔNG nâng giới hạn. Nó NÉN video cho vừa giới hạn upload
+//      của server. Đó mới là cách video dài thực sự upload được.
+//   => Nó cũng KHÔNG hề hook setMaxRecordedDuration — trần quay là việc của ta.
+//
+// Chiến lược của LocketPlus: mặc định GIỮ 500MB (đúng yêu cầu người dùng),
+// chỉ nén khi bật "compressForUpload" (dùng khi upload bị server từ chối).
+
+static void LPConfigureExportSession(id session);
+
+static NSArray<NSString *> *LPExportPresetLadder(void) {
+    id v = [[LPConfig shared] obj:@"exportPresetLadder"];
+    if ([v isKindOfClass:[NSArray class]] && [v count]) return v;
+    // Mặc định = đúng thứ tự của dylib mẫu.
+    return @[@"AVAssetExportPreset1280x720",
+             @"AVAssetExportPreset1920x1080"];
+}
+
+// Chọn preset: nếu compressForUpload thì lấy preset đầu tiên tương thích,
+// ngược lại giữ nguyên preset app yêu cầu.
+static NSString *LPChoosePreset(id asset, NSString *requested) {
+    if (![[LPConfig shared] flag:@"compressForUpload" fallback:NO]) return requested;
+    if (!asset) return requested;
+
+    @try {
+        Class exp = NSClassFromString(@"AVAssetExportSession");
+        if (!exp) return requested;
+        SEL sel = NSSelectorFromString(@"exportPresetsCompatibleWithAsset:");
+        if (![exp respondsToSelector:sel]) return requested;
+
+        NSArray *compatible = ((id (*)(id, SEL, id))objc_msgSend)((id)exp, sel, asset);
+        if (![compatible isKindOfClass:[NSArray class]] || !compatible.count) return requested;
+
+        for (NSString *p in LPExportPresetLadder()) {
+            if ([compatible containsObject:p]) {
+                if (![p isEqualToString:requested]) {
+                    LPLog(@"[media] preset %@ → %@ (nén để vừa upload)", requested, p);
+                }
+                return p;
+            }
+        }
+    } @catch (NSException *e) { LPLog(@"[media] chọn preset lỗi: %@", e.reason); }
+    return requested;
+}
+
+static id (*gOrigExportInit)(id, SEL, id, NSString *);
+static id LPExportInit(id self, SEL _cmd, id asset, NSString *preset) {
+    IMP o = LPOrigIMPFor(self, _cmd);
+    if (!o) return nil;
+    NSString *use = LPChoosePreset(asset, preset);
+    id session = ((id (*)(id, SEL, id, NSString *))o)(self, _cmd, asset, use);
+    // _Configure của dylib mẫu chạy ngay sau khi tạo session.
+    if (session) {
+        @try { LPConfigureExportSession(session); }
+        @catch (__unused NSException *e) {}
+    }
+    return session;
+}
+
+// Tương đương _Configure của MHVideoPipeline, nhưng đọc config.
+static void LPConfigureExportSession(id session) {
+    if (!session) return;
+
+    if ([session respondsToSelector:@selector(setFileLengthLimit:)]) {
+        long long limit = [[LPConfig shared] flag:@"compressForUpload" fallback:NO]
+            ? (long long)[[LPConfig shared] dbl:@"uploadTargetBytes" fallback:6.0 * 1024 * 1024]
+            : (long long)LPVideoBytes();
+        ((void (*)(id, SEL, long long))objc_msgSend)(
+            session, @selector(setFileLengthLimit:), limit);
+    }
+    if ([session respondsToSelector:@selector(setShouldOptimizeForNetworkUse:)]) {
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(
+            session, @selector(setShouldOptimizeForNetworkUse:), YES);
+    }
+    if ([session respondsToSelector:@selector(setCanPerformMultiplePassesOverSourceMediaData:)]) {
+        // Dylib mẫu set NO. Multi-pass cần thêm dung lượng tạm và hay fail
+        // trên video dài → theo mẫu, chỉ bật khi người dùng yêu cầu.
+        BOOL multi = [[LPConfig shared] flag:@"exportMultiPass" fallback:NO];
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(
+            session, @selector(setCanPerformMultiplePassesOverSourceMediaData:), multi);
+    }
 }
 
 #pragma mark - AVAssetExportSession
@@ -89,17 +204,23 @@ static void LPExportTimeRange(id self, SEL _cmd, CMTimeRange r) {
 static void LPExportFileLengthLimit(id self, SEL _cmd, long long limit) {
     IMP o = LPOrigIMPFor(self, _cmd);
     if (!o) return;
+
+    // Chế độ nén để upload: KHÔNG nới, ngược lại còn hạ xuống mục tiêu.
+    // Nếu nới ở đây thì LPConfigureExportSession vừa set 6MB sẽ bị đẩy lại
+    // 500MB → mất tác dụng nén.
+    if ([[LPConfig shared] flag:@"compressForUpload" fallback:NO]) {
+        long long target = (long long)[[LPConfig shared] dbl:@"uploadTargetBytes"
+                                                    fallback:6.0 * 1024 * 1024];
+        long long use = (limit > 0 && limit < target) ? limit : target;
+        if (use != limit) LPLog(@"[media] fileLengthLimit %lld → %lld (nén)", limit, use);
+        ((void (*)(id, SEL, long long))o)(self, _cmd, use);
+        return;
+    }
+
     long long want = (long long)LPVideoBytes();
     long long use = (limit > 0 && limit < want) ? want : limit;
-    if (use != limit) LPLog(@"[media] export fileLengthLimit %lld → %lld", limit, use);
+    if (use != limit) LPLog(@"[media] fileLengthLimit %lld → %lld", limit, use);
     ((void (*)(id, SEL, long long))o)(self, _cmd, use);
-}
-// Export video dài cần nhiều pass; không bật thì AVAssetExportSession fail
-// giữa đường với video > ~2 phút hoặc > 200MB.
-static void LPExportMultiPass(id self, SEL _cmd, BOOL v) {
-    IMP o = LPOrigIMPFor(self, _cmd);
-    if (!o) return;
-    ((void (*)(id, SEL, BOOL))o)(self, _cmd, YES);
 }
 
 #pragma mark - UIImagePickerController (bản Locket cũ)
@@ -188,9 +309,9 @@ void LPInstallMediaHooks(void) {
                                (IMP)LPExportFileLengthLimit, NULL);
     BOOL d = LPHookMethodTyped(exp, @selector(setTimeRange:), "v",
                                (IMP)LPExportTimeRange, NULL);
-    BOOL e = LPHookMethodTyped(exp, @selector(setCanPerformMultiplePassesOverSourceMediaData:), "v",
-                               (IMP)LPExportMultiPass, NULL);
-    LPLog(@"[media] AVAssetExportSession limit=%d range=%d multipass=%d", c, d, e);
+    BOOL e = LPHookMethodTyped(exp, @selector(initWithAsset:presetName:), "@",
+                               (IMP)LPExportInit, (IMP *)&gOrigExportInit);
+    LPLog(@"[media] AVAssetExportSession limit=%d range=%d init=%d", c, d, e);
 
     Class picker = NSClassFromString(@"UIImagePickerController");
     BOOL f = LPHookMethodTyped(picker, @selector(setVideoMaximumDuration:), "v",
