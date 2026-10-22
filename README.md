@@ -12,24 +12,38 @@ Dự án tweak Objective-C tự đóng gói cho **Locket 2.68+**, gồm 4 khối
 
 ---
 
-## Sự thật kỹ thuật về 3 yêu cầu
+## Sự thật kỹ thuật (đã kiểm chứng trên binary 2.68 + dylib mẫu)
 
-1. **Kết bạn trên bản IPA sideload**
-   - `sendFriendRequest` / `acceptFriendRequest` là Cloud Function trên project `locket-4252a`.
-   - Nếu lỗi do **token đăng nhập hết hạn** (keychain bị đứt vì patch sideload) → `LPFriend.m` tự refresh ID token + replay **sẽ cứu được**.
-   - Nếu server bật **App Check ở mức attestation bắt buộc** cho team gốc `SWD4AZY4KG` → bản IPA ký bằng chứng chỉ khác **không thể tự tạo attestation hợp lệ** từ phía client. Màn hình **Chẩn đoán kết bạn** sẽ in rõ `HTTP` + `body` sau khi replay để bạn biết mình rơi vào trường hợp nào.
+### 1. Kết bạn trên IPA sideload — **không phá được ở client**
+- `sendFriendRequest` / `acceptFriendRequest` là Cloud Function (project `locket-4252a`), server kiểm `X-Firebase-AppCheck`.
+- Bản ký lại bằng chứng chỉ khác **không tạo được attestation hợp lệ** cho team `SWD4AZY4KG`. Refresh token không tạo ra attestation.
+- `MHProfileSupport.dylib` (bản V28) làm đúng một việc: **ép refresh ID token + App Check token khi gặp 401 rồi replay** — chỉ cứu được trường hợp token cũ/hỏng (keychain đứt khi sideload), không cứu được 403 App Check.
+- `LocketPlus` làm điều tương tự nhưng có log rõ ràng, và **phân biệt 401 vs 403**:
+  - `401` → tự refresh ID token + replay 1 lần (có thể cứu).
+  - `403` → log thẳng: App Check, bản sideload thua.
+- Đường duy nhất còn lại: cài bằng **TrollStore / jailbreak giữ nguyên chữ ký gốc**, hoặc để **người dùng bản App Store gốc** bấm accept link mời của bạn.
 
-2. **Quay 10 phút / 500MB**
-   - Trần ở **client** (`AVCaptureMovieFileOutput`, `UIImagePickerController`, `AVAssetExportSession`, kiểm tra `AVAsset.duration` / `NSFileSize`) đều đã bị nâng lên `600s` và `500MB` (sửa được trong `config.plist`).
-   - Nếu Locket có thêm một hàm Swift riêng kiểu `maxVideoDuration` → mở **L+ → Runtime Explorer → Quét method** gõ `duration` hoặc `size`, lấy tên `Class` + `selector` rồi điền vào mục `patches` của `config.plist` là ăn ngay, không cần biên dịch lại.
-   - Lưu ý: nếu **server** giới hạn kích thước upload ở tầng Cloud Storage Rules / transcode backend thì phần vượt trần server vẫn sẽ bị từ chối lúc upload (log `[net] upload` sẽ ghi rõ).
+### 2. Video 10 phút / 500MB — client thì phá được, server thì không
+- Đã nới: `AVCaptureMovieFileOutput.maxRecordedDuration / maxRecordedFileSize`, `AVAssetExportSession.timeRange / fileLengthLimit`, `UIImagePickerController.videoMaximumDuration`.
+- **Chọn video từ thư viện (PHPicker) không có setter để hook** — Locket 2.68 dùng PHPicker, nên "chọn video 10 phút" vẫn bị app kiểm duration/size sau khi load. Muốn phá phải dùng Runtime Explorer tìm hàm kiểm tra rồi thêm vào `patches`.
+- **Upload vẫn bị server chặn**: Storage rules + Cloud Function kiểm duration/size. Hook client chỉ giúp quay/chọn được, không giúp upload được.
+- Nút quay có progress ring do ViewModel Swift đếm — giữ tay 10 phút có thể bị UI tự ngắt dù trần đã nới.
 
-3. **Trang Profile+ mới**
-   - Mở từ nút **✨** trong menu profile của Locket hoặc từ **L+ → Mở Profile+**.
-   - Chạm ảnh bìa / avatar để đổi ảnh, chạm ✏️ để sửa tên + quote + bài hát + ca sĩ + lyric, nút `+` để thêm ảnh tiêu biểu hoặc bạn thân (kèm chữ huy hiệu tuỳ chọn như `★ Bestie`, `💛 Bạn thân`).
-   - Toàn bộ dữ liệu lưu cục bộ tại `Documents/LocketPlus/profile.plist` + ảnh `.jpg` cùng thư mục. (Chỉ hiển thị trên máy bạn; server Locket không có trường dữ liệu cho các mục này.)
+### 3. Trang Profile+ (ảnh bìa, avatar, quote, nhạc + lyric, ảnh tiêu biểu, bạn thân + huy hiệu)
+- Hoàn toàn **cục bộ** (`Documents/LocketPlus/`). Server Locket không có trường cho các mục này nên người khác không thấy.
 
 ---
+
+## Những lỗi đã sửa ở v1.3 (bản cũ crash ngay khi mở app)
+
+| Lỗi | Hậu quả | Sửa |
+|---|---|---|
+| Hook `-[GTMSessionFetcher startWithCompletionHandler:]` rồi KVC `request`/`response` | Class không có property đó → **NSException mỗi request** → app chết | Bỏ; hook `NSURLSession` và chỉ bọc request kết bạn |
+| Hook `-[AVAsset duration]` | Nổ ngay khi đọc duration video | Bỏ (getter này cũng không chặn được gì) |
+| Hook `-[NSFileManager attributesOfItemAtPath:error:]` | Chạy liên tục, ghi đè `NSFileSize` làm đọc file lỗi | Bỏ |
+| Hook `viewDidAppear:` của class Swift trong constructor | Class chưa tồn tại → hook không bao giờ gắn | `LPWhenClassReady` chờ class rồi mới hook |
+| `patches` trong config bị đánh dấu "đã xử lý" khi class chưa có | Patch im lặng không có tác dụng | Chỉ đánh dấu sau khi hook thành công |
+| `LPHook` ghi IMP gốc của chính mình khi hook lặp | Hook chồng hook → đệ quy | `LPHookMethod` kiểm tra trùng |
 
 ## Cách build `LocketPlus.dylib`
 

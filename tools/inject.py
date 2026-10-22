@@ -37,7 +37,7 @@ def inject_into_app(app_dir: str, dylibs):
         shutil.copy2(lib, dst)
         os.chmod(dst, 0o755)
         path = "@rpath/" + os.path.basename(lib)
-        if any(path in c.name for c in bin_.commands if hasattr(c, "name") and c.name == path):
+        if any(getattr(c, "name", None) == path for c in bin_.commands):
             print(f"[=] đã có load command cho {path}")
             continue
         cmd = lief.MachO.DylibCommand.library(path)
@@ -74,11 +74,21 @@ def inject_ipa(ipa_in: str, ipa_out: str, dylibs):
     if not apps:
         sys.exit("IPA không có Payload/*.app")
     inject_into_app(apps[0], dylibs)
+    # Payload phải đứng đầu zip và symlink trong .app phải giữ là symlink,
+    # nếu không iOS từ chối cài ("app cannot be installed").
     with zipfile.ZipFile(ipa_out, "w", zipfile.ZIP_DEFLATED) as z:
-        for root, _, files in os.walk(work):
-            for f in files:
+        for root, dirs, files in os.walk(work):
+            dirs.sort()
+            for f in sorted(files):
                 full = os.path.join(root, f)
-                z.write(full, os.path.relpath(full, work))
+                arc = os.path.relpath(full, work)
+                if os.path.islink(full):
+                    info = zipfile.ZipInfo(arc)
+                    info.create_system = 3
+                    info.external_attr = (0o120777 << 16)
+                    z.writestr(info, os.readlink(full))
+                else:
+                    z.write(full, arc)
     print(f"[✓] IPA: {ipa_out}")
 
 
