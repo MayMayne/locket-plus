@@ -267,7 +267,8 @@ static void LPNotesCopy(NSString *note) {
 }
 
 // Alert nhập note tự viết.
-static void LPNotesShowCompose(void) {
+// Bản có callback: dùng cho thanh bàn phím (cần chèn vào ô đang gõ).
+static void LPNotesShowComposeWithHandler(void (^handler)(NSString *note)) {
     UIViewController *vc = LPNotesTopViewController();
     if (!vc) return;
 
@@ -285,84 +286,155 @@ static void LPNotesShowCompose(void) {
         NSString *text = weakAlert.textFields.firstObject.text;
         NSString *trimmed = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (trimmed.length == 0) return;
-        LPNotesAdd(trimmed);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            LPShowAlert(@"Đã lưu ghi chú", trimmed);
-        });
+        if (handler) handler(trimmed);
     }]];
     [a addAction:[UIAlertAction actionWithTitle:@"Huỷ" style:UIAlertActionStyleCancel handler:nil]];
-
     [vc presentViewController:a animated:YES completion:nil];
 }
 
-// Trộn ngẫu nhiên (Fisher–Yates) rồi lấy tối đa n phần tử.
-static NSArray<NSString *> *LPNotesSample(NSArray<NSString *> *src, NSUInteger n) {
-    if (src.count == 0 || n == 0) return @[];
-    NSMutableArray<NSString *> *arr = [src mutableCopy];
-    for (NSUInteger i = arr.count; i > 1; i--) {
-        NSUInteger j = arc4random_uniform((uint32_t)i);
-        [arr exchangeObjectAtIndex:(i - 1) withObjectAtIndex:j];
-    }
-    if (arr.count > n) [arr removeObjectsInRange:NSMakeRange(n, arr.count - n)];
-    return arr;
+// Bản cho menu cũ (giữ để tương thích) — lưu rồi báo đã lưu.
+static void LPNotesShowCompose(void) {
+    LPNotesShowComposeWithHandler(^(NSString *note) {
+        LPNotesAdd(note);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            LPShowAlert(@"Đã lưu ghi chú", note);
+        });
+    });
 }
 
-#pragma mark - picker
+#pragma mark - thanh phụ trên bàn phím (thay cho menu)
 
-void LPNotesShowPicker(void) {
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ LPNotesShowPicker(); });
-        return;
+// Gắn một dải nút gợi ý ngay trên bàn phím khi người dùng gõ caption.
+// Đây là chỗ tự nhiên nhất: không có nút nổi, không có menu.
+@interface LPNotesAccessory : UIView
+@property (nonatomic, weak) UITextField *field;
+@property (nonatomic, weak) UITextView *textView;
+@property (nonatomic, strong) UIScrollView *scroll;
+@end
+
+@implementation LPNotesAccessory
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.backgroundColor = [UIColor secondarySystemBackgroundColor];
+        self.scroll = [[UIScrollView alloc] initWithFrame:self.bounds];
+        self.scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        self.scroll.showsHorizontalScrollIndicator = NO;
+        [self addSubview:self.scroll];
+        [self rebuild];
+    }
+    return self;
+}
+
+- (void)rebuild {
+    for (UIView *v in self.scroll.subviews) [v removeFromSuperview];
+    CGFloat x = 8;
+    CGFloat h = 34;
+    CGFloat y = (self.bounds.size.height - h) / 2.0;
+
+    // 6 gợi ý ngẫu nhiên + nút "thêm" để tự viết
+    NSArray *picks = LPNotesSample(LPNotesPresets(), 6);
+    for (NSString *note in picks) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+        b.backgroundColor = [UIColor tertiarySystemBackgroundColor];
+        b.layer.cornerRadius = h / 2.0;
+        b.titleLabel.font = [UIFont systemFontOfSize:12];
+        b.contentEdgeInsets = UIEdgeInsetsMake(0, 12, 0, 12);
+        [b setTitle:note forState:UIControlStateNormal];
+        [b sizeToFit];
+        b.frame = CGRectMake(x, y, b.frame.size.width + 24, h);
+        [b addTarget:self action:@selector(insert:) forControlEvents:UIControlEventTouchUpInside];
+        [self.scroll addSubview:b];
+        x = CGRectGetMaxX(b.frame) + 8;
     }
 
-    UIViewController *vc = LPNotesTopViewController();
-    if (!vc) {
-        LPLog(@"[notes] không tìm được view controller, bỏ qua picker");
-        return;
+    UIButton *more = [UIButton buttonWithType:UIButtonTypeSystem];
+    [more setTitle:@"✏️" forState:UIControlStateNormal];
+    more.backgroundColor = [UIColor tertiarySystemBackgroundColor];
+    more.layer.cornerRadius = h / 2.0;
+    more.frame = CGRectMake(x, y, h, h);
+    [more addTarget:self action:@selector(compose) forControlEvents:UIControlEventTouchUpInside];
+    [self.scroll addSubview:more];
+    x = CGRectGetMaxX(more.frame) + 8;
+
+    self.scroll.contentSize = CGSizeMake(x, self.bounds.size.height);
+}
+
+// Chèn vào đúng ô đang gõ, giữ nguyên text cũ.
+- (void)insert:(UIButton *)b {
+    NSString *note = [b titleForState:UIControlStateNormal];
+    if (!note.length) return;
+    if (self.textView) {
+        self.textView.text = [self.textView.text stringByAppendingString:note];
+        [self notifyChanged:self.textView];
+    } else if (self.field) {
+        self.field.text = [self.field.text stringByAppendingString:note];
+        [self notifyChanged:self.field];
     }
+    [self rebuild];   // đổi gợi ý mới sau mỗi lần chèn
+}
 
-    NSArray<NSString *> *presets = LPNotesSample(LPNotesPresets(), 12);   // tối đa 12 preset
-    NSArray<NSString *> *mine = LPNotesUserNotes();
-    if (mine.count > 8) mine = [mine subarrayWithRange:NSMakeRange(0, 8)]; // tối đa 8 note
+- (void)compose {
+    __weak LPNotesAccessory *weakSelf = self;
+    LPNotesShowComposeWithHandler(^(NSString *note) {
+        if (!note.length) return;
+        LPNotesAdd(note);
+        if (weakSelf.textView) {
+            weakSelf.textView.text = [weakSelf.textView.text stringByAppendingString:note];
+            [weakSelf notifyChanged:weakSelf.textView];
+        } else if (weakSelf.field) {
+            weakSelf.field.text = [weakSelf.field.text stringByAppendingString:note];
+            [weakSelf notifyChanged:weakSelf.field];
+        }
+        [weakSelf rebuild];
+    });
+}
 
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Ghi chú genz"
-                                                                   message:@"Chọn một câu để copy"
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-    __weak UIAlertController *weakSheet = sheet;
-
-    // 1) preset ngẫu nhiên
-    for (NSString *note in presets) {
-        [sheet addAction:[UIAlertAction actionWithTitle:note style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
-            NSString *text = note;
-            LPNotesAfterSheet(weakSheet, ^{ LPNotesCopy(text); });
-        }]];
+// Phải gửi thông báo để SwiftUI/Combine của Locket nhận được thay đổi text.
+- (void)notifyChanged:(id)control {
+    if ([control isKindOfClass:[UITextField class]]) {
+        [[NSNotificationCenter defaultCenter] postNotificationName:UITextFieldTextDidChangeNotification
+                                                            object:control];
+    } else if ([control isKindOfClass:[UITextView class]]) {
+        [[NSNotificationCenter defaultCenter] postNotificationName:UITextViewTextDidChangeNotification
+                                                            object:control];
     }
+}
+@end
 
-    // 2) note người dùng tự viết
-    for (NSString *note in mine) {
-        NSString *title = [NSString stringWithFormat:@"📝 %@", note];
-        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
-            NSString *text = note;
-            LPNotesAfterSheet(weakSheet, ^{ LPNotesCopy(text); });
-        }]];
-    }
+void LPInstallNotesAccessory(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        // UITextField: gắn inputAccessoryView qua method swizzle của
+        // -[UITextField inputAccessoryView] là không cần thiết — chỉ cần
+        // gắn khi field bắt đầu edit.
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UITextFieldTextDidBeginEditingNotification
+                        object:nil queue:[NSOperationQueue mainQueue]
+                   usingBlock:^(NSNotification *n) {
+            UITextField *f = n.object;
+            if (![f isKindOfClass:[UITextField class]]) return;
+            if ([f.inputAccessoryView isKindOfClass:[LPNotesAccessory class]]) return;
+            LPNotesAccessory *a = [[LPNotesAccessory alloc] initWithFrame:CGRectMake(0, 0, 0, 44)];
+            a.field = f;
+            f.inputAccessoryView = a;
+            [f reloadInputViews];
+        }];
 
-    // 3) tự viết
-    [sheet addAction:[UIAlertAction actionWithTitle:@"✏️ Tự viết" style:UIAlertActionStyleDefault handler:^(UIAlertAction *act) {
-        LPNotesAfterSheet(weakSheet, ^{ LPNotesShowCompose(); });
-    }]];
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UITextViewTextDidBeginEditingNotification
+                        object:nil queue:[NSOperationQueue mainQueue]
+                   usingBlock:^(NSNotification *n) {
+            UITextView *tv = n.object;
+            if (![tv isKindOfClass:[UITextView class]]) return;
+            if ([tv.inputAccessoryView isKindOfClass:[LPNotesAccessory class]]) return;
+            LPNotesAccessory *a = [[LPNotesAccessory alloc] initWithFrame:CGRectMake(0, 0, 0, 44)];
+            a.textView = tv;
+            tv.inputAccessoryView = a;
+            [tv reloadInputViews];
+        }];
 
-    // 4) huỷ
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Huỷ" style:UIAlertActionStyleCancel handler:nil]];
-
-    // iPad: action sheet cần điểm neo, thiếu sẽ crash.
-    if (sheet.popoverPresentationController) {
-        sheet.popoverPresentationController.sourceView = vc.view;
-        sheet.popoverPresentationController.sourceRect =
-            CGRectMake(vc.view.bounds.size.width / 2.0, vc.view.bounds.size.height / 2.0, 1.0, 1.0);
-    }
-
-    [vc presentViewController:sheet animated:YES completion:nil];
-    LPLog(@"[notes] picker: %lu preset + %lu note", (unsigned long)presets.count, (unsigned long)mine.count);
+        LPLog(@"[notes] thanh gợi ý bàn phím đã bật");
+    });
 }

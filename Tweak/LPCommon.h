@@ -43,16 +43,15 @@ NSArray<NSString *> *LPNotesUserNotes(void);
 void LPNotesAdd(NSString *note);
 void LPNotesRemove(NSString *note);
 void LPNotesShowPicker(void);
+void LPInstallNotesAccessory(void);
 void LPApplyConfiguredPatches(void);
 void LPReapplyPatches(void);
 
 // UI / tiện ích
 void LPShowText(UIViewController *host, NSString *title, NSString *text);
 void LPShowAlert(NSString *title, NSString *msg);
-void LPShowHub(UIViewController *host);
-void LPOpenExplorer(UIViewController *host);
 void LPOpenProfile(UIViewController *host);
-void LPRunFriendProbe(UIViewController *host);
+void LPRunFriendProbe(UIViewController *host);   // ghi log, không hiện UI
 
 // Bảng IMP gốc dùng chung cho mọi hook
 void LPSetOrigIMP(Class cls, SEL sel, IMP imp);

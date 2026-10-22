@@ -165,76 +165,14 @@ void LPOpenExplorer(UIViewController *host) {
 
 #pragma mark - menu tổng
 
-void LPShowHub(UIViewController *host) {
+// KHÔNG còn menu. Giữ lại đúng 1 hàm: mở Runtime Explorer từ một nút bấm
+// (nếu sau này cần), và hàm mở Explorer vẫn dùng được cho mục đích debug.
+void LPOpenExplorer(UIViewController *host) {
     dispatch_async(dispatch_get_main_queue(), ^{
-        UIViewController *vc = host;
+        UIViewController *vc = LPResolveExplorerHost(host);
         while (vc.presentedViewController) vc = vc.presentedViewController;
-        UIAlertController *a = [UIAlertController alertControllerWithTitle:@"Locket+"
-                                                                  message:[NSString stringWithFormat:@"Video: %.0fs / %.0fMB",
-                                                                           LPVideoSeconds(), LPVideoBytes() / 1048576.0]
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
-        void (^add)(NSString *, void (^)(void)) = ^(NSString *t, void (^h)(void)) {
-            [a addAction:[UIAlertAction actionWithTitle:t style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) { h(); }]];
-        };
-        add(@"👤 Mở Profile+", ^{ LPOpenProfile(vc); });
-        add(@"💛 Kiểm tra Gold (client)", ^{
-            NSMutableString *o = [NSMutableString string];
-            Class rc = NSClassFromString(@"RCCustomerInfo");
-            Class rv = NSClassFromString(@"FIRRemoteConfigValue");
-            [o appendFormat:@"RCCustomerInfo: %@\nFIRRemoteConfigValue: %@\n",
-                rc ? @"có" : @"KHÔNG", rv ? @"có" : @"KHÔNG"];
-            [o appendString:@"\nGold ở đây là client-side. Server vẫn coi là free:\n"];
-            [o appendString:@"- badge không hiện với người khác\n"];
-            [o appendString:@"- hạn mức kết bạn phía server không đổi\n"];
-            [o appendString:@"\nXem log để biết đã hook những class nào."];
-            LPShowText(vc, @"Gold", o);
-        });
-        add(@"🔍 Chẩn đoán kết bạn", ^{ LPRunFriendProbe(vc); });
-        add(@"✍️ Ghi chú genz", ^{ LPNotesShowPicker(); });
-        add(@"🎞 Đổi tỉ lệ video", ^{
-            UIAlertController *r = [UIAlertController alertControllerWithTitle:@"Chọn tỉ lệ"
-                                                                      message:@"Áp dụng khi xuất video"
-                                                               preferredStyle:UIAlertControllerStyleActionSheet];
-            NSArray *ratios = @[@"original", @"9:16", @"6:19", @"16:9", @"19:6", @"1:1"];
-            for (NSString *rt in ratios) {
-                [r addAction:[UIAlertAction actionWithTitle:rt style:UIAlertActionStyleDefault handler:^(UIAlertAction *_) {
-                    NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:[LPConfig path:@"config.plist"]] mutableCopy]
-                                             ?: [NSMutableDictionary dictionary];
-                    d[@"videoRatio"] = rt;
-                    [d writeToFile:[LPConfig path:@"config.plist"] atomically:YES];
-                    [[LPConfig shared] reload];
-                    LPShowAlert(@"Locket+", [NSString stringWithFormat:@"Tỉ lệ video: %@", rt]);
-                }]];
-            }
-            [r addAction:[UIAlertAction actionWithTitle:@"Huỷ" style:UIAlertActionStyleCancel handler:nil]];
-            if (r.popoverPresentationController) r.popoverPresentationController.sourceView = vc.view;
-            [vc presentViewController:r animated:YES completion:nil];
-        });
-        add(@"🧭 Runtime Explorer", ^{ LPOpenExplorer(vc); });
-        add(@"📄 Xem log", ^{ LPShowText(nil, @"Locket+ log", [LPConfig logText]); });
-        add(@"💥 Crash gần nhất", ^{
-            NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-            NSString *p = [[dir stringByAppendingPathComponent:@"LocketPlus"] stringByAppendingPathComponent:@"crash.txt"];
-            NSString *t = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil];
-            LPShowText(vc, @"crash.txt", t.length ? t : @"(không có crash.txt — app chưa từng crash trong tweak)");
-        });
-        add(@"🛟 Bật/tắt chế độ an toàn", ^{
-            LPConfig *c = [LPConfig shared];
-            BOOL on = [c flag:@"safeMode" fallback:NO];
-            NSMutableDictionary *d = [[NSDictionary dictionaryWithContentsOfFile:[LPConfig path:@"config.plist"]] mutableCopy]
-                                     ?: [NSMutableDictionary dictionary];
-            d[@"safeMode"] = @(!on);
-            [d writeToFile:[LPConfig path:@"config.plist"] atomically:YES];
-            [c reload];
-            LPShowAlert(@"Locket+", !on ? @"Đã BẬT chế độ an toàn.\nMở lại app để áp dụng (chỉ còn nút L+)."
-                                       : @"Đã TẮT chế độ an toàn.\nMở lại app để hook hoạt động lại.");
-        });
-        add(@"⚙️ Sửa config.plist", ^{ LPShowText(nil, @"config.plist", [NSString stringWithContentsOfFile:[LPConfig path:@"config.plist"] encoding:NSUTF8StringEncoding error:nil]); });
-        add(@"♻️ Nạp lại config", ^{ LPReapplyPatches();
-            LPShowAlert(@"Locket+", [NSString stringWithFormat:@"Đã nạp lại.\nVideo %.0fs / %.0fMB",
-                                     LPVideoSeconds(), LPVideoBytes() / 1048576.0]); });
-        [a addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
-        if (a.popoverPresentationController) a.popoverPresentationController.sourceView = vc.view;
-        [vc presentViewController:a animated:YES completion:nil];
+        LPExplorerViewController *e = [LPExplorerViewController new];
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:e];
+        [vc presentViewController:nav animated:YES completion:nil];
     });
 }

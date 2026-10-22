@@ -182,7 +182,10 @@ static id LPUploadTaskHook(id self, SEL _cmd, NSURLRequest *req, NSData *body, i
 
 #pragma mark - probe
 
+// Chẩn đoán KHÔNG hiện UI: ghi kết quả vào Documents/LocketPlus/friend.log
+// để xem lại bằng file, không làm phiền người dùng.
 void LPRunFriendProbe(UIViewController *host) {
+    (void)host;
     NSMutableString *out = [NSMutableString string];
     [out appendString:LPFriendLogText()];
     [out appendString:@"\n===== probe =====\n"];
@@ -190,11 +193,15 @@ void LPRunFriendProbe(UIViewController *host) {
         NSClassFromString(@"FIRAuth") ? @"có" : @"KHÔNG",
         NSClassFromString(@"FIRAppCheck") ? @"có" : @"KHÔNG"];
     LPFetchIDToken(^(NSString *idToken, NSString *idErr) {
-        [out appendFormat:@"ID token: %@\n", idToken ? [NSString stringWithFormat:@"ok %lu ký tự", (unsigned long)idToken.length] : idErr];
+        [out appendFormat:@"ID token: %@\n",
+            idToken ? [NSString stringWithFormat:@"ok %lu ký tự", (unsigned long)idToken.length] : idErr];
         LPFetchAppCheckToken(^(NSString *acToken, NSString *acErr) {
-            [out appendFormat:@"AppCheck: %@\n", acToken ? [NSString stringWithFormat:@"ok %lu ký tự", (unsigned long)acToken.length] : acErr];
+            [out appendFormat:@"AppCheck: %@\n",
+                acToken ? [NSString stringWithFormat:@"ok %lu ký tự", (unsigned long)acToken.length] : acErr];
             [out appendString:@"\n401 → refresh cứu được. 403 → App Check, không cứu được.\n"];
-            LPShowText(host, @"Chẩn đoán kết bạn", out);
+            [out writeToFile:[LPConfig path:@"friend.log"] atomically:YES
+                    encoding:NSUTF8StringEncoding error:nil];
+            LPLog(@"[friend] probe đã ghi friend.log");
         });
     });
 }
