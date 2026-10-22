@@ -38,7 +38,7 @@ static void LPBoot(void) {
     @catch (NSException *e) { LPLog(@"[boot] rc: %@", e.reason); }
 
     LPBootStep("gold");
-    @try { LPInstallGoldNetProcessor(); LPInstallGoldHooks(); }
+    @try { LPInvalidateRevenueCatCacheOnce(); LPInstallGoldNetProcessor(); LPInstallGoldHooks(); }
     @catch (NSException *e) { LPLog(@"[boot] gold: %@", e.reason); }
 
     LPBootStep("friend");

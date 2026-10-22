@@ -85,6 +85,7 @@ void LPInstallMediaHooks(void);
 void LPInstallGoldHooks(void);
 void LPInstallRemoteConfigHooks(void);
 void LPInstallGoldNetProcessor(void);
+void LPInvalidateRevenueCatCacheOnce(void);
 void LPInstallFriendTools(void);
 void LPInstallFriendNetProcessor(void);
 void LPRunFriendProbe(void);
