@@ -8,20 +8,11 @@ Tweak/LPFriend.m:76:45: note: used here
    76 |     return FIRApp ? [FIRApp performSelector:NSSelectorFromString(@"defaultApp")] : nil;
       |                                             ^
 1 warning generated.
-Tweak/LPNotes.m:16:29: warning: function 'LPNotesSample' has internal linkage but is not defined [-Wundefined-internal]
-   16 | static NSArray<NSString *> *LPNotesSample(NSArray<NSString *> *src, NSUInteger n);
-      |                             ^
-Tweak/LPNotes.m:340:22: note: used here
-  340 |     NSArray *picks = LPNotesSample(LPNotesPresets(), 6);
-      |                      ^
-1 warning generated.
-ld: warning: Could not find or use auto-linked framework 'CoreAudioTypes': framework 'CoreAudioTypes' not found
-ld: warning: Could not find or use auto-linked framework 'UIUtilities': framework 'UIUtilities' not found
-Undefined symbols for architecture arm64:
-  "_LPNotesSample", referenced from:
-      -[LPNotesAccessory rebuild] in LPNotes-9fc733.o
-ld: symbol(s) not found for architecture arm64
-clang: error: linker command failed with exit code 1 (use -v to see invocation)
-exit=1
+==> build/LocketPlus.dylib
+Non-fat file: build/LocketPlus.dylib is architecture: arm64
+Executable=/Users/runner/work/locket-plus/locket-plus/build/LocketPlus.dylib
+Identifier=LocketPlus-555549444868f5eedd79371a818b1af99e4017e4
+Format=Mach-O thin (arm64)
+exit=0
 
 ```
