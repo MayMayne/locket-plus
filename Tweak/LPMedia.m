@@ -299,15 +299,31 @@ static AVMutableVideoComposition *LPFitComposition(AVAsset *asset, double ratio)
 
 #pragma mark - hỏi tỉ lệ (kiểu _ChooseRatio của mẫu)
 
-static void LPAskRatio(void (^done)(NSString *choice)) {
-    void (^finish)(NSString *) = ^(NSString *c) { if (done) done(c); };
+static void LPAskRatioOnMain(void (^done)(NSString *choice));
 
+static void LPAskRatio(void (^done)(NSString *choice)) {
     // UIAlertController PHẢI present trên main thread. exportAsynchronously có
     // thể được gọi từ background → dispatch, không present tại chỗ.
     if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{ LPAskRatio(done); });
+        dispatch_async(dispatch_get_main_queue(), ^{ LPAskRatioOnMain(done); });
         return;
     }
+    LPAskRatioOnMain(done);
+}
+
+static void LPAskRatioOnMain(void (^done)(NSString *choice)) {
+    // Chỉ định nghĩa MỘT lần cho mỗi lần gọi. Nếu người dùng không trả lời
+    // trong 20s (app bị đẩy nền, alert bị che), tự chạy tiếp với "auto" —
+    // KHÔNG được treo luồng export.
+    __block BOOL answered = NO;
+    void (^finish)(NSString *) = ^(NSString *c) {
+        if (answered) return;
+        answered = YES;
+        if (done) done(c ?: @"auto");
+    };
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ finish(@"auto"); });
 
     UIWindow *win = nil;
     @try {
