@@ -16,6 +16,10 @@
 #import "LPCommon.h"
 #import <signal.h>
 #import <execinfo.h>
+#import <fcntl.h>
+#import <unistd.h>
+#import <stdio.h>
+#import <string.h>
 
 #pragma mark - ghi crash
 
@@ -26,23 +30,39 @@ void LPWriteCrashText(NSString *text) {
 }
 
 static void LPWriteCrash(const char *why, int sig) {
-    // Chỉ dùng hàm async-signal-safe tối thiểu; Foundation ở đây có thể chết
-    // nếu crash xảy ra khi heap hỏng → bọc @try và bỏ qua nếu fail.
-    @try {
-        void *frames[64];
-        int n = backtrace(frames, 64);
-        NSMutableString *s = [NSMutableString stringWithFormat:
-            @"Locket+ crash: %s (signal %d)\n", why, sig];
-        NSString *trace = [NSString stringWithContentsOfFile:LPPath(@"boot.trace")
-                                                    encoding:NSUTF8StringEncoding error:nil];
-        if (trace.length) [s appendFormat:@"bước cuối: %@\n", trace];
-        char **syms = backtrace_symbols(frames, n);
-        if (syms) {
-            for (int i = 0; i < n; i++) [s appendFormat:@"%s\n", syms[i]];
-            free(syms);
-        }
-        LPWriteCrashText(s);
-    } @catch (__unused NSException *e) {}
+    // Trong signal handler, Foundation/ObjC CÓ THỂ chết (heap hỏng, lock giữ).
+    // Bản trước dùng NSMutableString + writeToFile → handler chết luôn, và ta
+    // chỉ nhận được template rỗng. Giờ dùng syscall trực tiếp, không ObjC.
+    char buf[8192];
+    int n = 0;
+
+    n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                  "Locket+ crash: %s (signal %d)\n", why, sig);
+
+    // Bước boot cuối — đọc bằng open/read thuần.
+    int fd = open(LPPath(@"boot.trace").fileSystemRepresentation, O_RDONLY);
+    if (fd >= 0) {
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "bước cuối: ");
+        ssize_t r = read(fd, buf + n, sizeof(buf) - (size_t)n - 2);
+        if (r > 0) n += (int)r;
+        close(fd);
+        if (n > 0 && buf[n - 1] != '\n') buf[n++] = '\n';
+    }
+
+    // Stack trace: backtrace_symbols cấp phát bộ nhớ → dùng backtrace() thô.
+    void *frames[64];
+    int count = backtrace(frames, 64);
+    for (int i = 0; i < count && n < (int)sizeof(buf) - 32; i++) {
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n, "  #%d %p\n", i, frames[i]);
+    }
+
+    int out = open(LPPath(@"crash.txt").fileSystemRepresentation,
+                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out >= 0) {
+        ssize_t ignored = write(out, buf, (size_t)n);
+        (void)ignored;
+        close(out);
+    }
 }
 
 static void LPSignalHandler(int sig) {
@@ -75,6 +95,33 @@ void LPBootStep(const char *name) {
         [fh writeData:d];
         [fh closeFile];
     } @catch (__unused NSException *e) {}
+}
+
+// Ghi "đang chạy tới đây" sau khi boot xong. Không có cái này thì crash sau
+// boot chỉ để lại boot.trace đã đủ bước "done" — không biết chết ở đâu.
+// Gọi từ các điểm nghi ngờ (hook chạy lần đầu, processor chạy lần đầu...).
+void LPTrace(const char *what) {
+    static NSLock *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSLock new]; });
+    [lock lock];
+    @try {
+        NSString *p = LPPath(@"live.trace");
+        NSString *line = [NSString stringWithFormat:@"%s\n", what];
+        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        if (!fh) { [d writeToFile:p atomically:YES]; }
+        else {
+            [fh seekToEndOfFile];
+            [fh writeData:d];
+            [fh closeFile];
+            NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:nil];
+            if ([a[NSFileSize] unsignedLongLongValue] > 64 * 1024) {
+                [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
+            }
+        }
+    } @catch (__unused NSException *e) {}
+    [lock unlock];
 }
 
 #pragma mark - install

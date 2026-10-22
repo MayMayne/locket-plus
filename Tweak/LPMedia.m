@@ -41,6 +41,7 @@ static BOOL gMediaInstalled = NO;
 #pragma mark - AVCaptureMovieFileOutput
 
 static void LPMaxDuration(id self, SEL _cmd, CMTime t) {
+    LPTrace("media.maxDuration");
     double want = LPVideoSeconds();
     double real = CMTimeGetSeconds(t);
     if (isfinite(real) && real > 0 && real < want) {
@@ -126,6 +127,7 @@ static NSString *LPChoosePreset(id asset, NSString *requested) {
 
 static id (*gOrigExportInit)(id, SEL, id, NSString *);
 static id LPExportInit(id self, SEL _cmd, id asset, NSString *preset) {
+    LPTrace("media.exportInit");
     IMP o = LPOrigIMPFor(self, _cmd);
     if (!o) return nil;
     NSString *use = LPChoosePreset(asset, preset);

@@ -104,7 +104,9 @@ static void LPFetchIDToken(void (^done)(NSString *, NSString *)) {
     id auth = ((id (*)(id, SEL, id))objc_msgSend)((id)FIRAuth, authSel, app);
     if (!auth) { done(nil, @"auth nil"); return; }
 
-    id user = ((id (*)(id, SEL))objc_msgSend)(auth, NSSelectorFromString(@"currentUser"));
+    SEL cuSel = NSSelectorFromString(@"currentUser");
+    if (![auth respondsToSelector:cuSel]) { done(nil, @"thiếu currentUser"); return; }
+    id user = ((id (*)(id, SEL))objc_msgSend)(auth, cuSel);
     if (!user) { done(nil, @"chưa đăng nhập"); return; }
 
     SEL sel = NSSelectorFromString(@"getIDTokenForcingRefresh:completion:");
@@ -221,10 +223,63 @@ static void LPHandleFriendResponse(NSURLRequest *req, NSData *data,
 
 #pragma mark - GTMSessionFetcher (Firebase dùng cái này, không dùng completion block)
 
-// Firebase/GTMSessionFetcher gọi mạng qua DELEGATE, không qua completionHandler
-// → hook NSURLSession completion KHÔNG bắt được request kết bạn.
-// MHProfileSupport xử lý đúng chỗ này: nghe 2 notification của GTMSessionFetcher.
-// Đây chỉ là observer, không swizzle gì → không thể crash app.
+// BÁM SÁT _FetcherFinished của MHProfileSupport (đã dịch ngược @0xd4f0):
+// nó kiểm `respondsToSelector:` TRƯỚC MỌI lệnh gửi và KHÔNG dùng KVC.
+//
+// Bản trước của tôi dùng [fetcher valueForKey:@"request"] — KVC trên object
+// không có property đó ném NSUnknownKeyException. @try bọc ngoài không cứu
+// được nếu exception xảy ra trên thread khác hoặc trong notification queue.
+// Đây là đường dẫn crash thật.
+//
+// Cách đúng: respondsToSelector → gửi message trực tiếp.
+
+static id LPMsg(id obj, const char *selName) {
+    if (!obj) return nil;
+    SEL s = sel_registerName(selName);
+    if (![obj respondsToSelector:s]) return nil;
+    return ((id (*)(id, SEL))objc_msgSend)(obj, s);
+}
+
+static BOOL LPMsgBool(id obj, const char *selName) {
+    if (!obj) return NO;
+    SEL s = sel_registerName(selName);
+    if (![obj respondsToSelector:s]) return NO;
+    return ((BOOL (*)(id, SEL))objc_msgSend)(obj, s);
+}
+
+static void LPHandleFetcherNotification(NSNotification *note) {
+    @autoreleasepool {
+        @try {
+            id fetcher = note.object;
+            if (!fetcher) return;
+
+            // Notification có thể là NSNotification với object là fetcher,
+            // hoặc chính fetcher. MHProfileSupport dùng -object.
+            if (![fetcher respondsToSelector:sel_registerName("request")]) {
+                id inner = LPMsg(fetcher, "object");
+                if (inner) fetcher = inner;
+            }
+
+            id request = LPMsg(fetcher, "request");
+            if (![request isKindOfClass:[NSURLRequest class]]) return;
+
+            NSURL *url = ((NSURLRequest *)request).URL;
+            if (!LPFriendURL(url)) return;
+
+            id response = LPMsg(fetcher, "response");
+            id data = LPMsg(fetcher, "downloadedData");
+            id error = LPMsg(fetcher, "error");
+
+            LPHandleFriendResponse(request,
+                                   [data isKindOfClass:[NSData class]] ? data : nil,
+                                   [response isKindOfClass:[NSURLResponse class]] ? response : nil,
+                                   [error isKindOfClass:[NSError class]] ? error : nil);
+        } @catch (NSException *e) {
+            LPLog(@"[friend] fetcher observer: %@", e.reason);
+        }
+    }
+}
+
 static void LPObserveFetcherNotifications(void) {
     static BOOL done = NO;
     if (done) return;
@@ -236,27 +291,7 @@ static void LPObserveFetcherNotifications(void) {
         [[NSNotificationCenter defaultCenter]
             addObserverForName:n object:nil queue:nil
                    usingBlock:^(NSNotification *note) {
-            @autoreleasepool {
-                @try {
-                    id fetcher = note.object;
-                    if (!fetcher) return;
-
-                    id request = [fetcher valueForKey:@"request"];
-                    if (![request isKindOfClass:[NSURLRequest class]]) return;
-                    if (!LPFriendURL(((NSURLRequest *)request).URL)) return;
-
-                    id response = [fetcher valueForKey:@"response"];
-                    id data = [fetcher valueForKey:@"downloadedData"];
-                    id error = [fetcher valueForKey:@"error"];
-
-                    LPHandleFriendResponse(request,
-                                           [data isKindOfClass:[NSData class]] ? data : nil,
-                                           [response isKindOfClass:[NSURLResponse class]] ? response : nil,
-                                           [error isKindOfClass:[NSError class]] ? error : nil);
-                } @catch (NSException *e) {
-                    LPLog(@"[friend] fetcher observer: %@", e.reason);
-                }
-            }
+            LPHandleFetcherNotification(note);
         }];
     }
     LPLog(@"[friend] đã nghe GTMSessionFetcher notifications");

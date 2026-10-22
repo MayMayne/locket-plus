@@ -28,6 +28,7 @@ static LPConfig *gConfig;
     NSString *p = LPPath(@"config.plist");
     if (![[NSFileManager defaultManager] fileExistsAtPath:p]) {
         NSDictionary *def = @{
+            @"mediaEnabled"         : @YES,
             @"maxVideoSeconds"      : @600,
             @"maxVideoBytes"        : @(500.0 * 1024 * 1024),
             @"keepMicOnRecord"      : @YES,
@@ -212,24 +213,73 @@ IMP LPOrigIMPForClass(Class cls, SEL sel) {
     return v ? (IMP)v.pointerValue : NULL;
 }
 
-#pragma mark - hook an toàn
+#pragma mark - hook an toàn (bám sát _Hook của MHVideoPipeline + blatantsPatch)
+
+// TÌM CLASS SỞ HỮU METHOD THẬT.
+//
+// Đây là khác biệt quyết định so với bản trước của tôi:
+//
+//   SAI (bản cũ): class_getInstanceMethod(cls, sel) → nếu cls KHÔNG tự cài
+//   method, hàm này ĐI LÊN class cha và trả Method của CHA. Rồi
+//   method_setImplementation sửa Method của CHA → ảnh hưởng MỌI subclass.
+//   Ví dụ hook -[NSURLSession dataTaskWithRequest:] khi method thật nằm ở
+//   __NSCFURLSession: mọi session trong app (kể cả của hệ thống) đều chạy qua
+//   code của tôi, và một chỗ sai ABI là chết toàn app.
+//
+//   ĐÚNG (cả 2 dylib mẫu đều làm thế — _Hook @0x8364 của MHVideoPipeline,
+//   _ObserveMethod @0x4570 của blatantsPatch): duyệt class_copyMethodList
+//   từng class trong chuỗi kế thừa để biết CHÍNH XÁC class nào sở hữu method:
+//     • owner == class đích  → method_setImplementation (sửa tại chỗ)
+//     • owner != class đích  → class_addMethod lên class đích (tạo bản riêng,
+//                              class cha và các sibling KHÔNG bị đụng)
+static Method LPOwnedMethod(Class cls, SEL sel, Class *ownerOut) {
+    for (Class c = cls; c; c = class_getSuperclass(c)) {
+        unsigned int n = 0;
+        Method *list = class_copyMethodList(c, &n);
+        if (!list) continue;
+        Method found = NULL;
+        for (unsigned i = 0; i < n; i++) {
+            if (method_getName(list[i]) == sel) { found = list[i]; break; }
+        }
+        free(list);
+        if (found) {
+            if (ownerOut) *ownerOut = c;
+            return found;
+        }
+    }
+    return NULL;
+}
 
 BOOL LPHookMethod(Class cls, SEL sel, IMP newImp, IMP *origOut) {
     if (!cls || !sel || !newImp) return NO;
-    Method m = class_getInstanceMethod(cls, sel);
+
+    Class owner = Nil;
+    Method m = LPOwnedMethod(cls, sel, &owner);
     if (!m) return NO;
+
     IMP orig = method_getImplementation(m);
-    // Đã hook rồi (hook lặp) → KHÔNG ghi IMP của chính mình làm "bản gốc",
-    // nếu không sẽ đệ quy vô hạn. Lấy lại bản gốc đã lưu trong bảng.
+    // Đã hook rồi (hook lặp) → không ghi IMP của chính mình làm "bản gốc".
     if (orig == newImp) {
-        if (origOut) {
-            IMP stored = LPOrigIMPForClass(cls, sel);
-            *origOut = stored ?: orig;
-        }
+        if (origOut) *origOut = LPOrigIMPForClass(cls, sel) ?: orig;
         return YES;
     }
+
+    if (owner == cls) {
+        LPSetOrigIMP(cls, sel, orig);
+        if (origOut) *origOut = orig;
+        method_setImplementation(m, newImp);
+        return YES;
+    }
+
+    // Method thừa kế từ class cha → thêm bản riêng cho class đích.
+    // Nhờ vậy class cha và các subclass khác KHÔNG bị ảnh hưởng.
+    const char *types = method_getTypeEncoding(m);
+    if (!types) return NO;
     LPSetOrigIMP(cls, sel, orig);
     if (origOut) *origOut = orig;
+    if (class_addMethod(cls, sel, newImp, types)) return YES;
+
+    // class_addMethod fail (hiếm) → đành sửa tại chỗ.
     method_setImplementation(m, newImp);
     return YES;
 }
@@ -237,7 +287,8 @@ BOOL LPHookMethod(Class cls, SEL sel, IMP newImp, IMP *origOut) {
 BOOL LPHookMethodTyped(Class cls, SEL sel, const char *expectReturn,
                        IMP newImp, IMP *origOut) {
     if (!cls || !sel || !newImp) return NO;
-    Method m = class_getInstanceMethod(cls, sel);
+    Class owner = Nil;
+    Method m = LPOwnedMethod(cls, sel, &owner);
     if (!m) return NO;
     const char *enc = method_getTypeEncoding(m);
     if (!enc || !enc[0]) return NO;
@@ -341,15 +392,45 @@ static void LPRunNetProcessors(NSURLRequest *req, LPNetResult *res) {
 
 #pragma mark - hook NSURLSession
 
+// Chỉ bọc completion khi CÓ processor quan tâm URL này. Trước đây tôi bọc
+// MỌI request (kể cả tải ảnh, video, WebSocket) → mỗi response đều đi qua code
+// của tweak, và bất kỳ lỗi nào cũng làm app chết. Giờ lọc trước.
+static BOOL LPAnyProcessorWants(NSURL *url) {
+    if (!url) return NO;
+    NSString *host = url.host.lowercaseString ?: @"";
+    NSString *path = url.path.lowercaseString ?: @"";
+
+    // RevenueCat (Gold)
+    if ([host isEqualToString:@"api.revenuecat.com"] ||
+        [host hasSuffix:@".revenuecat.com"]) {
+        if ([path containsString:@"/v1/subscribers/"] ||
+            [path containsString:@"/v1/receipts"]) return YES;
+    }
+    // Locket friend endpoints
+    if ([host isEqualToString:@"api.locketcamera.com"] ||
+        [host hasSuffix:@"cloudfunctions.net"] ||
+        [host hasSuffix:@".run.app"]) {
+        if ([path containsString:@"friend"]) return YES;
+    }
+    return NO;
+}
+
 static id LPDataTask(id self, SEL _cmd, NSURLRequest *req, id completion) {
     IMP o = LPOrigIMPFor(self, _cmd);
     if (!o) return nil;
+
+    // Không quan tâm → gọi thẳng, KHÔNG bọc. Đây là đường đi của 99% request.
+    if (!LPAnyProcessorWants(req.URL)) {
+        return ((id (*)(id, SEL, NSURLRequest *, id))o)(self, _cmd, req, completion);
+    }
+
     void (^orig)(NSData *, NSURLResponse *, NSError *) =
         (void (^)(NSData *, NSURLResponse *, NSError *))completion;
     if (!orig) {
         return ((id (*)(id, SEL, NSURLRequest *, id))o)(self, _cmd, req, completion);
     }
     id wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
+        LPTrace("net.completion");
         @autoreleasepool {
             @try {
                 LPNetResult *r = [LPNetResult new];
@@ -360,6 +441,7 @@ static id LPDataTask(id self, SEL _cmd, NSURLRequest *req, id completion) {
                 resp = r.response;
             } @catch (__unused NSException *e) {}
         }
+        LPTrace("net.call-orig");
         orig(data, resp, err);
     };
     return ((id (*)(id, SEL, NSURLRequest *, id))o)(self, _cmd, req, wrapped);
@@ -368,12 +450,17 @@ static id LPDataTask(id self, SEL _cmd, NSURLRequest *req, id completion) {
 static id LPDataURLTask(id self, SEL _cmd, NSURL *url, id completion) {
     IMP o = LPOrigIMPFor(self, _cmd);
     if (!o) return nil;
+
+    if (!LPAnyProcessorWants(url)) {
+        return ((id (*)(id, SEL, NSURL *, id))o)(self, _cmd, url, completion);
+    }
+
     void (^orig)(NSData *, NSURLResponse *, NSError *) =
         (void (^)(NSData *, NSURLResponse *, NSError *))completion;
     if (!orig) {
         return ((id (*)(id, SEL, NSURL *, id))o)(self, _cmd, url, completion);
     }
-    NSURLRequest *req = url ? [NSURLRequest requestWithURL:url] : nil;
+    NSURLRequest *req = [NSURLRequest requestWithURL:url];
     id wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
         @autoreleasepool {
             @try {
@@ -395,68 +482,23 @@ void LPInstallNetHooks(void) {
     if (done) return;
     done = YES;
 
+    // BÁM SÁT AutoRcSideload: nó hook ĐÚNG MỘT class là NSURLSession, và chỉ
+    // 2 selector dataTask*. Bản trước của tôi quét MỌI subclass (6 class, 10
+    // method) — gồm cả class private của hệ thống. Đó là hook quá rộng:
+    // mỗi response của app đều đi qua code của tôi, và bất kỳ lỗi nào trong
+    // đó (hoặc ABI sai ở một subclass) đều làm app chết.
+    //
+    // NSURLSession là class trừu tượng nhưng method nằm ngay trên nó, và
+    // __NSCFURLSession KHÔNG override 2 selector này — nên hook 1 class là đủ.
+    Class s = NSClassFromString(@"NSURLSession");
+    if (!s) { LPLog(@"[net] không có NSURLSession"); return; }
+
     SEL a = @selector(dataTaskWithRequest:completionHandler:);
     SEL b = @selector(dataTaskWithURL:completionHandler:);
 
-    // NSURLSession là class cluster. Hook lớp trừu tượng KHÔNG đủ: lớp cụ thể
-    // (__NSCFURLSession) override lại. Phải hook TẤT CẢ subclass đang có, và
-    // quét lại sau vài giây vì Firebase/RevenueCat tạo session muộn.
-    NSMutableSet<NSString *> *names = [NSMutableSet setWithObject:@"NSURLSession"];
-    [names addObject:@"__NSCFURLSession"];
+    BOOL okA = LPHookMethod(s, a, (IMP)LPDataTask, NULL);
+    BOOL okB = LPHookMethod(s, b, (IMP)LPDataURLTask, NULL);
+    LPLog(@"[net] hook NSURLSession request=%d url=%d", okA, okB);
 
-    Class base = NSClassFromString(@"NSURLSession");
-    if (base) {
-        int count = objc_getClassList(NULL, 0);
-        if (count > 0) {
-            Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
-            if (classes) {
-                count = objc_getClassList(classes, count);
-                for (int i = 0; i < count; i++) {
-                    Class c = classes[i];
-                    if (c == base) continue;
-                    if (!class_getSuperclass(c)) continue;
-                    BOOL isSub = NO;
-                    for (Class p = class_getSuperclass(c); p; p = class_getSuperclass(p)) {
-                        if (p == base) { isSub = YES; break; }
-                    }
-                    if (isSub) {
-                        const char *n = class_getName(c);
-                        if (n) [names addObject:[NSString stringWithUTF8String:n]];
-                    }
-                }
-                free(classes);
-            }
-        }
-    }
-
-    NSInteger hooked = 0;
-    for (NSString *n in names) {
-        Class c = NSClassFromString(n);
-        if (!c) continue;
-        // Chỉ hook khi class THẬT SỰ có method (không tính thừa kế) — nếu
-        // không sẽ sửa Method của lớp cha nhiều lần (vô hại nhưng thừa).
-        if (class_getInstanceMethod(c, a)) {
-            if (LPHookMethod(c, a, (IMP)LPDataTask, NULL)) hooked++;
-        }
-        if (class_getInstanceMethod(c, b)) {
-            if (LPHookMethod(c, b, (IMP)LPDataURLTask, NULL)) hooked++;
-        }
-    }
-    LPLog(@"[net] hook %ld method trên %lu class", (long)hooked, (unsigned long)names.count);
-
-    // Quét lại: session của Firebase/RevenueCat có thể nạp sau.
-    for (int i = 1; i <= 3; i++) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            for (NSString *n in names) {
-                Class c = NSClassFromString(n);
-                if (!c) continue;
-                if (!class_getInstanceMethod(c, a)) continue;
-                if (method_getImplementation(class_getInstanceMethod(c, a)) == (IMP)LPDataTask) continue;
-                LPHookMethod(c, a, (IMP)LPDataTask, NULL);
-                LPHookMethod(c, b, (IMP)LPDataURLTask, NULL);
-                LPLog(@"[net] hook muộn %@", n);
-            }
-        });
-    }
+    if (!okA && !okB) LPLog(@"[net] không hook được — Gold/Friend sẽ không thấy response");
 }

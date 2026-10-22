@@ -109,22 +109,23 @@ static void LPRebindImage(const struct mach_header_64 *mh, intptr_t slide,
 
         const struct section_64 *sect = (const struct section_64 *)(seg + 1);
         for (uint32_t s = 0; s < seg->nsects; s++, sect++) {
-            // __la_symbol_ptr : con trỏ lazy, KHÔNG ký PAC kể cả trên arm64e
-            //                   (stub dùng `br x16`, không dùng `braa`).
-            // __nl_symbol_ptr : tên cũ của non-lazy, con trỏ thường.
-            // __got/__auth_got: non-lazy. Trên arm64e đây là con trỏ ĐÃ KÝ PAC
-            //                   (stub dùng `braa`) → ghi con trỏ thường vào là
-            //                   crash. Chỉ vá khi binary là arm64 thuần.
+            // __la_symbol_ptr : con trỏ lazy, KHÔNG ký PAC.
+            // __nl_symbol_ptr : tên cũ của non-lazy.
+            // __got           : non-lazy, con trỏ THƯỜNG — kể cả trên arm64e.
+            //                   (blatantsPatch vá đúng section này và chạy được.)
+            // __auth_got      : CHỈ section này mới là con trỏ ĐÃ KÝ PAC trên
+            //                   arm64e (stub dùng `braa`). Ghi con trỏ thường
+            //                   vào là crash → phải bỏ qua.
             BOOL isLazy = (strcmp(sect->sectname, "__la_symbol_ptr") == 0);
             BOOL isLegacyNonLazy = (strcmp(sect->sectname, "__nl_symbol_ptr") == 0);
-            BOOL isGot = (strcmp(sect->sectname, "__got") == 0 ||
-                          strcmp(sect->sectname, "__auth_got") == 0);
+            BOOL isGot = (strcmp(sect->sectname, "__got") == 0);
+            BOOL isAuthGot = (strcmp(sect->sectname, "__auth_got") == 0);
 
-            if (!isLazy && !isLegacyNonLazy && !isGot) continue;
+            if (!isLazy && !isLegacyNonLazy && !isGot && !isAuthGot) continue;
             if (sect->size < sizeof(void *)) continue;
 
-            if (isGot && LPImageIsArm64e(mh)) {
-                LPLog(@"[sideload] bỏ qua %s (arm64e, con trỏ PAC)", sect->sectname);
+            if (isAuthGot) {
+                LPLog(@"[sideload] bỏ qua __auth_got (con trỏ PAC trên arm64e)");
                 continue;
             }
 
@@ -340,14 +341,40 @@ static NSURL *LPContainerURL(id self, SEL _cmd, NSString *groupID) {
 
 #pragma mark - NSUserDefaults suite fallback
 
-static id (*gOrigInitSuite)(id, SEL, NSString *);
+// blatantsPatch hook ĐÚNG selector private `_initWithSuiteName:container:`
+// (không phải `initWithSuiteName:` như tôi từng viết).
+//
+// Private init này nhận thêm container; nếu container không tồn tại (app group
+// chưa có khi sideload) thì nó trả nil hoặc object hỏng → mọi lần đọc/ghi
+// defaults của app đi vào hư không, và có đường dẫn tới crash.
+//
+// Cách của mẫu: thay container bằng thư mục thay thế có thật, rồi gọi init gốc.
+// KHÔNG trả standardUserDefaults — làm vậy là trộn dữ liệu của app với dữ liệu
+// của app group, và trả về object khác class mà caller mong đợi.
+static id (*gOrigInitSuiteContainer)(id, SEL, NSString *, id);
 
-static id LPInitSuite(id self, SEL _cmd, NSString *suite) {
-    id r = gOrigInitSuite ? gOrigInitSuite(self, _cmd, suite) : nil;
+static id LPInitSuiteContainer(id self, SEL _cmd, NSString *suite, id container) {
+    if (!gOrigInitSuiteContainer) return nil;
+
+    // Thử nguyên bản trước — nếu app group có thật thì không cần can thiệp.
+    id r = gOrigInitSuiteContainer(self, _cmd, suite, container);
     if (r) return r;
-    // Suite không tồn tại (app group chưa có) → trả standard defaults thay vì nil.
-    LPLog(@"[sideload] suite %@ → nil, dùng standard", suite);
-    return [NSUserDefaults standardUserDefaults];
+
+    // Không có → thay container bằng thư mục thay thế của group tương ứng.
+    NSString *groupID = nil;
+    if ([suite isKindOfClass:[NSString class]] && [suite containsString:@"locket"]) {
+        groupID = suite;
+    } else if ([container isKindOfClass:[NSString class]] &&
+               [container containsString:@"locket"]) {
+        groupID = container;
+    }
+    if (!groupID.length) return nil;
+
+    NSString *path = LPGroupPathFor(groupID);
+    if (!path.length) return nil;
+
+    LPLog(@"[sideload] suite %@ container nil → %@", suite, path);
+    return gOrigInitSuiteContainer(self, _cmd, suite, path);
 }
 
 #pragma mark - install
@@ -376,11 +403,14 @@ void LPInstallSideloadFixes(void) {
             LPLog(@"[sideload] swizzle containerURL");
         }
 
-        // 4) NSUserDefaults suite (phòng khi group không có thật).
+        // 4) NSUserDefaults suite (private init — đúng như blatantsPatch).
         Class ud = NSClassFromString(@"NSUserDefaults");
-        if (LPHookMethod(ud, @selector(initWithSuiteName:), (IMP)LPInitSuite,
-                         (IMP *)&gOrigInitSuite)) {
-            LPLog(@"[sideload] swizzle initWithSuiteName:");
+        SEL suiteSel = NSSelectorFromString(@"_initWithSuiteName:container:");
+        if (LPHookMethodTyped(ud, suiteSel, "@", (IMP)LPInitSuiteContainer,
+                              (IMP *)&gOrigInitSuiteContainer)) {
+            LPLog(@"[sideload] swizzle _initWithSuiteName:container:");
+        } else {
+            LPLog(@"[sideload] không hook _initWithSuiteName:container: (không có)");
         }
     }
 }

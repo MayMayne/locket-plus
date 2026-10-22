@@ -25,25 +25,30 @@ static void LPBoot(void) {
         return;
     }
 
+    // Trace của lượt trước không còn giá trị — xoá để lần này đọc được đúng.
+    [[NSFileManager defaultManager] removeItemAtPath:LPPath(@"live.trace") error:nil];
+
     LPBootStep("net");
     @try { LPInstallNetHooks(); }
     @catch (NSException *e) { LPLog(@"[boot] net: %@", e.reason); }
 
-    LPBootStep("media");
-    @try { LPInstallMediaHooks(); }
-    @catch (NSException *e) { LPLog(@"[boot] media: %@", e.reason); }
+    if ([[LPConfig shared] flag:@"mediaEnabled" fallback:YES]) {
+        LPBootStep("media");
+        @try { LPInstallMediaHooks(); }
+        @catch (NSException *e) { LPLog(@"[boot] media: %@", e.reason); }
+    }
 
-    LPBootStep("rc");
-    @try { LPInstallRemoteConfigHooks(); }
-    @catch (NSException *e) { LPLog(@"[boot] rc: %@", e.reason); }
+    if ([[LPConfig shared] flag:@"goldUnlock" fallback:YES]) {
+        LPBootStep("gold");
+        @try { LPInvalidateRevenueCatCacheOnce(); LPInstallGoldNetProcessor(); }
+        @catch (NSException *e) { LPLog(@"[boot] gold: %@", e.reason); }
+    }
 
-    LPBootStep("gold");
-    @try { LPInvalidateRevenueCatCacheOnce(); LPInstallGoldNetProcessor(); LPInstallGoldHooks(); }
-    @catch (NSException *e) { LPLog(@"[boot] gold: %@", e.reason); }
-
-    LPBootStep("friend");
-    @try { LPInstallFriendTools(); }
-    @catch (NSException *e) { LPLog(@"[boot] friend: %@", e.reason); }
+    if ([[LPConfig shared] flag:@"friendDiagnostics" fallback:YES]) {
+        LPBootStep("friend");
+        @try { LPInstallFriendTools(); }
+        @catch (NSException *e) { LPLog(@"[boot] friend: %@", e.reason); }
+    }
 
     // Probe chạy ngầm, ghi file, không hiện UI.
     if ([[LPConfig shared] flag:@"friendDiagnostics" fallback:YES]) {
