@@ -8,7 +8,7 @@ Một dylib duy nhất cho **Locket 2.68+**, viết lại từ đầu sau khi di
 | Việc | Cách làm | Có thật sự được không |
 |---|---|---|
 | **Sống sót sideload** (không màn đen, không hỏng đăng nhập) | Canary keychain → đọc access group THẬT → fishhook `SecItem*` để THAY group (không xoá) + swizzle `containerURLForSecurityApplicationGroupIdentifier:` | ✅ Chắc chắn — đây đúng là cách `blatantsPatch` làm |
-| **Quay 10 phút / 500MB** | `AVCaptureMovieFileOutput.setMaxRecordedDuration/FileSize` → 600s / 500MB; `AVAssetExportSession.setFileLengthLimit` → 500MB; `setCanPerformMultiplePassesOverSourceMediaData` → YES; preset ladder HighestQuality→1920x1080→1280x720→Medium | ✅ Phía client. Upload vẫn phải qua Storage rules của Locket |
+| **Quay 10 phút / 500MB** | `AVCaptureMovieFileOutput.setMaxRecordedDuration/FileSize` → 600s / 500MB; `AVAssetExportSession.setFileLengthLimit` → 500MB. Thêm chế độ `compressForUpload` (theo đúng chiến lược `MHVideoPipeline`) để nén vừa giới hạn upload | ✅ Quay/chọn được. Upload vẫn phải qua Storage rules của Locket |
 | **Mở khoá Gold** | Rewrite JSON response của `api.revenuecat.com/v1/subscribers/*` (thêm entitlement + subscription còn hạn) → SDK tự parse ra CustomerInfo có Gold; + nhân bản entitlement key; + `activeSubscriptions` | ⚠️ **Client-side.** UI/gate của app mở. Badge trên máy người khác KHÔNG hiện (server không biết) |
 | **Kết bạn** | Chẩn đoán: bắt request `sendFriendRequest`/`acceptFriendRequest`, log HTTP status + body; 401 → refresh ID token + App Check rồi replay 1 lần; mở hạn mức bạn bè qua Remote Config | ⚠️ 401 cứu được. **403 (App Check) thì không** — xem dưới |
 
@@ -42,6 +42,9 @@ dùng bản App Store gốc bấm accept link mời.
 | `keepMicOnRecord` | true | Giữ audio session để video có tiếng |
 | `addMicInput` | true | Thêm micro vào AVCaptureSession nếu thiếu |
 | `expandExportRange` | **false** | Nới `AVAssetExportSession.timeRange` (phá trim của user — chỉ bật nếu biết mình làm gì) |
+| `compressForUpload` | **false** | Theo chiến lược `MHVideoPipeline`: hạ preset + ép `fileLengthLimit` về `uploadTargetBytes` |
+| `uploadTargetBytes` | 6291456 (6MB) | Đích dung lượng khi nén |
+| `exportMultiPass` | **false** | `setCanPerformMultiplePassesOverSourceMediaData` (mẫu để NO) |
 | `safeMode` | false | Tắt toàn bộ hook (cứu hộ) |
 
 ## Chẩn đoán
@@ -82,3 +85,22 @@ Xoá `blatantsPatch.dylib`, `AutoRcSideload.dylib` cũ nếu có — chúng hook
 | `MSHookFunction` cho `SecItem*` | Vá mã máy trong dyld shared cache → iOS 15+ giết process trong constructor (lỗi v1.12) |
 | `CFDictionaryRemoveValue(query, kSecAttrAccessGroup)` | Xoá group → Firebase Auth mất phiên → màn đen + quay mãi ở login (lỗi v1.12/v1.13) |
 | Hook `-[AVAsset duration]`, `-[NSFileManager attributesOfItemAtPath:]` | Getter trả struct / chạy hàng nghìn lần → crash hoặc làm hỏng đọc file |
+
+
+## Đính chính: tôi đã đọc sai `MHVideoPipeline` (sửa ngày 22/10)
+
+Bản README trước ghi 4 điều **sai** về dylib mẫu. Sau khi đọc lại từng lệnh assembly:
+
+| Tôi ghi sai | Sự thật (kèm địa chỉ) |
+|---|---|
+| Preset ladder `HighestQuality → 1920x1080 → 1280x720 → Medium` | Ladder **hạ cấp**, thứ tự thật: **1280x720 trước**, rồi 1920x1080, không có cả hai thì giữ preset gốc (`0x8558`, `0x8590`, `0x85c0`) |
+| `setFileLengthLimit` → 500MB | `0x600000` = **6 MB** (`0x8de0`) |
+| `setCanPerformMultiplePassesOverSourceMediaData` → YES | **NO** (`0x8e78`) |
+| Hằng `0x17c88` = "600 giây" | Đó là **timescale của `kCMTimeZero`** (`value=0, timescale=600, flags=1`), dùng cho `setTransform:atTime:` trong `_FitComposition` — không liên quan thời lượng |
+| (ngầm hiểu) dylib này nâng trần quay | **Không hề hook `setMaxRecordedDuration`/`FileSize`**. Nó chỉ hook `-[AVAssetExportSession initWithAsset:presetName:]` (`_ExportInit` @ `0x8420`) |
+
+**Kết luận đúng:** `MHVideoPipeline` là tweak **nén video cho vừa giới hạn upload**, không phải tweak nâng giới hạn. Đó mới là cách video dài thực sự upload được — vì server Locket kiểm dung lượng ở Storage rules.
+
+Vì vậy `LocketPlus` giờ làm **cả hai**, tách bằng config: mặc định nâng trần (600s/500MB) như bạn yêu cầu; bật `compressForUpload` thì chuyển sang chiến lược nén của dylib mẫu.
+
+Bài học: đừng suy ra hành vi từ tên hằng số. `600` trong một `CMTime` là **timescale**, không phải số giây.
