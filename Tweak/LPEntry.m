@@ -24,7 +24,7 @@ static void LPInstallLate(void) {
     @try {
         LPInstallNetHooks();
         LPInstallGold();
-        LPInstallMedia();
+        LPInstallUpload();
         LPMarkBootOK();
     } @catch (NSException *e) {
         LPLog(@"[boot] lỗi cài đặt: %@", e.reason);
@@ -47,6 +47,18 @@ static void LPInit(void) {
         if (!LPSafeMode()) {
             @try { LPInstallSideloadFixes(); }
             @catch (NSException *e) { LPLog(@"[boot] sideload lỗi: %@", e.reason); }
+
+            // 3b: MEDIA phải cài NGAY, không chờ app lên.
+            //
+            // Locket pre-warm AVCaptureSession lúc khởi động và đặt
+            // maxRecordedDuration = 15s ở đó. Nếu ta cài hook sau (600ms) thì
+            // lời gọi đó đã xảy ra rồi → trần vẫn 15 giây. Đây đúng là triệu
+            // chứng "quay được có 15 giây".
+            //
+            // AVFoundation đã nạp sẵn khi dylib này được dyld nạp (Locket link
+            // AVFoundation), nên swizzle ở đây an toàn.
+            @try { LPInstallMedia(); }
+            @catch (NSException *e) { LPLog(@"[boot] media lỗi: %@", e.reason); }
         } else {
             LPLog(@"[boot] safeMode — bỏ qua sideload fix");
         }

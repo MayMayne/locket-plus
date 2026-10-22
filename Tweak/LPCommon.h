@@ -85,3 +85,4 @@ void LPInstallSideloadFixes(void);
 void LPWatchdogStart(void);
 void LPInstallGold(void);
 void LPInstallMedia(void);
+void LPInstallUpload(void);

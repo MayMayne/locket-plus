@@ -108,69 +108,116 @@ static void LPExportFileLengthLimit(id self, SEL _cmd, long long limit) {
     ((void (*)(id, SEL, long long))o)(self, _cmd, use);
 }
 
-#pragma mark - mic (tuỳ chọn, mặc định TẮT)
+#pragma mark - ép trần ngay lúc bắt đầu ghi
 
-// Đổi graph của AVCaptureSession mà Locket đã dựng → AVCaptureMovieFileOutput
-// mất connection → bấm quay là fail. Đây là lý do "không quay được vid".
+// VÌ SAO CẦN: hook setMaxRecordedDuration chỉ có tác dụng nếu Locket gọi nó
+// SAU khi ta cài hook. Locket pre-warm camera session lúc khởi động và đặt
+// 15 giây ở đó → hook cài sau (600ms) không bao giờ thấy lời gọi đó → trần
+// vẫn là 15 giây. Đây đúng là triệu chứng user báo.
 //
-// Chỉ chạy khi `addMicInput = true` VÀ session chưa chạy VÀ chưa có audio.
-// Mỗi session chỉ thử một lần (associated object).
-static const void *kLPMicTried = &kLPMicTried;
+// Cách chắc chắn: hook startRecordingToOutputFileURL:recordingDelegate: và
+// ĐẶT LẠI trần ngay trước khi gọi IMP gốc. Lúc này output đã tồn tại, setter
+// luôn có tác dụng.
+//
+// ABI: tham số thứ 3 là NSURL*, thứ 4 là id<AVCaptureFileOutputRecordingDelegate>.
+static void (*gOrigStartRecording)(id, SEL, NSURL *, id);
 
-static void LPEnsureMicInput(id session) {
-    if (!session) return;
-    if (![[LPConfig shared] flag:@"addMicInput" fallback:NO]) return;
-    if (objc_getAssociatedObject(session, kLPMicTried)) return;
-    objc_setAssociatedObject(session, kLPMicTried, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+static void LPStartRecording(id self, SEL _cmd, NSURL *url, id delegate) {
+    IMP o = LPOrigIMPFor(self, _cmd);
+    if (!o) return;
 
     @try {
-        if ([session respondsToSelector:@selector(isRunning)] &&
-            ((BOOL (*)(id, SEL))objc_msgSend)(session, @selector(isRunning))) {
-            return;                       // đang chạy → không được sửa graph
+        double want = LPEffectiveRecordSeconds();
+        long long bytes = (long long)LPMaxRecordBytes();
+
+        if ([self respondsToSelector:@selector(setMaxRecordedDuration:)]) {
+            ((void (*)(id, SEL, CMTime))objc_msgSend)(self,
+                @selector(setMaxRecordedDuration:), CMTimeMakeWithSeconds(want, 600));
+        }
+        if ([self respondsToSelector:@selector(setMaxRecordedFileSize:)]) {
+            ((void (*)(id, SEL, long long))objc_msgSend)(self,
+                @selector(setMaxRecordedFileSize:), bytes);
         }
 
-        SEL selInputs = @selector(inputs);
-        if (![session respondsToSelector:selInputs]) return;
+        // Log giá trị THẬT đang có, để biết hook có ăn hay không.
+        double cur = -1;
+        if ([self respondsToSelector:@selector(maxRecordedDuration)]) {
+            CMTime t = ((CMTime (*)(id, SEL))objc_msgSend)(self,
+                                                          @selector(maxRecordedDuration));
+            cur = CMTimeGetSeconds(t);
+        }
+        LPLog(@"[media] bắt đầu ghi — trần đặt %.0fs (đọc lại: %.0fs)", want, cur);
+    } @catch (NSException *e) {
+        LPLog(@"[media] ép trần lỗi: %@", e.reason);
+    }
 
-        NSArray *inputs = ((NSArray *(*)(id, SEL))objc_msgSend)(session, selInputs);
+    ((void (*)(id, SEL, NSURL *, id))o)(self, _cmd, url, delegate);
+}
+
+#pragma mark - mic (tuỳ chọn)
+
+// Đổi graph của AVCaptureSession giữa lúc chạy → AVCaptureMovieFileOutput mất
+// connection → bấm quay là fail. Đó là lỗi v5.x.
+//
+// Cách ĐÚNG: thêm mic vào lúc session ĐANG ĐƯỢC DỰNG, không phải lúc chạy.
+// Hook -[AVCaptureSession addOutput:] — Locket gọi hàm này khi lắp
+// AVCaptureMovieFileOutput. Ngay sau đó graph còn đang mở, thêm audio input
+// là hợp lệ và không phá gì.
+static const void *kLPMicTried = &kLPMicTried;
+
+static void (*gOrigAddOutput)(id, SEL, id);
+
+static void LPAddOutput(id self, SEL _cmd, id output) {
+    IMP o = LPOrigIMPFor(self, _cmd);
+    if (o) ((void (*)(id, SEL, id))o)(self, _cmd, output);
+
+    if (![[LPConfig shared] flag:@"addMicInput" fallback:NO]) return;
+    if (![output isKindOfClass:NSClassFromString(@"AVCaptureMovieFileOutput")]) return;
+    if (objc_getAssociatedObject(self, kLPMicTried)) return;
+    objc_setAssociatedObject(self, kLPMicTried, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    @try {
+        // Đã có audio input thì thôi.
+        NSArray *inputs = ((NSArray *(*)(id, SEL))objc_msgSend)(self, @selector(inputs));
         if ([inputs isKindOfClass:[NSArray class]]) {
             for (id input in inputs) {
                 NSArray *ports = ((NSArray *(*)(id, SEL))objc_msgSend)(input, @selector(ports));
                 if (![ports isKindOfClass:[NSArray class]]) continue;
                 for (id port in ports) {
                     NSString *t = ((id (*)(id, SEL))objc_msgSend)(port, @selector(mediaType));
-                    if ([t isEqualToString:AVMediaTypeAudio]) return;   // đã có mic
+                    if ([t isEqualToString:AVMediaTypeAudio]) return;
                 }
             }
         }
 
         AVCaptureDevice *mic = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-        if (!mic) return;
+        if (!mic) { LPLog(@"[media] không có micro"); return; }
 
         NSError *e = nil;
         AVCaptureDeviceInput *in = [AVCaptureDeviceInput deviceInputWithDevice:mic error:&e];
         if (!in) { LPLog(@"[media] mic input lỗi: %@", e.localizedDescription); return; }
 
-        if ([session respondsToSelector:@selector(canAddInput:)] &&
-            !((BOOL (*)(id, SEL, id))objc_msgSend)(session, @selector(canAddInput:), in)) {
+        if ([self respondsToSelector:@selector(canAddInput:)] &&
+            !((BOOL (*)(id, SEL, id))objc_msgSend)(self, @selector(canAddInput:), in)) {
             LPLog(@"[media] canAddInput: mic = NO");
             return;
         }
 
-        ((void (*)(id, SEL))objc_msgSend)(session, @selector(beginConfiguration));
-        BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(session, @selector(addInput:), in);
-        ((void (*)(id, SEL))objc_msgSend)(session, @selector(commitConfiguration));
-        LPLog(@"[media] thêm micro: %d", ok);
+        BOOL ok = ((BOOL (*)(id, SEL, id))objc_msgSend)(self, @selector(addInput:), in);
+        LPLog(@"[media] thêm micro lúc dựng session: %d", ok);
+
+        // Audio session phải ở category cho phép ghi.
+        AVAudioSession *s = [AVAudioSession sharedInstance];
+        NSError *err = nil;
+        [s setCategory:AVAudioSessionCategoryPlayAndRecord
+                  mode:AVAudioSessionModeVideoRecording
+               options:AVAudioSessionCategoryOptionDefaultToSpeaker |
+                       AVAudioSessionCategoryOptionAllowBluetooth
+                 error:&err];
+        if (err) LPLog(@"[media] audio category: %@", err.localizedDescription);
     } @catch (NSException *e) {
         LPLog(@"[media] mic: %@", e.reason);
     }
-}
-
-static void LPStartRunning(id self, SEL _cmd) {
-    IMP o = LPOrigIMPFor(self, _cmd);
-    if (!o) return;
-    @try { LPEnsureMicInput(self); } @catch (__unused NSException *e) {}
-    ((void (*)(id, SEL))o)(self, _cmd);
 }
 
 #pragma mark - tỉ lệ khung
@@ -495,7 +542,11 @@ void LPInstallMedia(void) {
                                (IMP)LPMaxDuration, NULL);
     BOOL b = LPHookMethodTyped(out, @selector(setMaxRecordedFileSize:), "v",
                                (IMP)LPMaxFileSize, NULL);
-    LPLog(@"[media] trần quay duration=%d size=%d", a, b);
+    // Hook startRecording là thứ ĐẢM BẢO trần đúng, vì nó chạy ngay trước khi
+    // ghi và đặt lại giá trị tại chỗ.
+    BOOL a2 = LPHookMethod(out, @selector(startRecordingToOutputFileURL:recordingDelegate:),
+                           (IMP)LPStartRecording, (IMP *)&gOrigStartRecording);
+    LPLog(@"[media] trần quay duration=%d size=%d startRecording=%d", a, b, a2);
 
     // 2. Nâng ngưỡng dung lượng export — chỉ nâng, không hạ.
     Class exp = NSClassFromString(@"AVAssetExportSession");
@@ -518,10 +569,11 @@ void LPInstallMedia(void) {
     // thể vô tình kích hoạt.
     BOOL experimental = [[LPConfig shared] flag:@"experimental" fallback:NO];
 
-    if (experimental && [[LPConfig shared] flag:@"addMicInput" fallback:NO]) {
+    if ([[LPConfig shared] flag:@"addMicInput" fallback:NO]) {
         Class cap = NSClassFromString(@"AVCaptureSession");
-        BOOL e = LPHookMethod(cap, @selector(startRunning), (IMP)LPStartRunning, NULL);
-        LPLog(@"[media] mic (thử nghiệm) = %d", e);
+        BOOL e = LPHookMethod(cap, @selector(addOutput:), (IMP)LPAddOutput,
+                              (IMP *)&gOrigAddOutput);
+        LPLog(@"[media] mic = %d", e);
     }
 
     if (experimental && [[LPConfig shared] flag:@"frameRatioEnabled" fallback:NO]) {
