@@ -462,6 +462,42 @@ static id LPExportInit(id self, SEL _cmd, AVAsset *asset, NSString *preset) {
 
 #pragma mark - AVAssetExportSession
 
+// Ngân sách dung lượng theo độ dài clip.
+//   clip ngắn (≤ maxUploadSeconds) → nén về maxUploadBytes (15MB)
+//   video dài (quay 10 phút)       → trần quay maxRecordBytes (500MB)
+// Nhờ vậy "quay 10 phút 500MB" và "up 60s 15MB" cùng đúng.
+static void LPApplyBudget(id session, AVAsset *asset) {
+    if (!session) return;
+
+    double secs = 0;
+    @try {
+        if (asset) {
+            double d = CMTimeGetSeconds(asset.duration);
+            if (isfinite(d) && d > 0) secs = d;
+        }
+    } @catch (__unused NSException *e) {}
+
+    long long budget;
+    if (secs > 0 && secs <= LPUploadSeconds() + 0.5 &&
+        [[LPConfig shared] flag:@"compressShortUploads" fallback:YES]) {
+        budget = (long long)LPUploadBytes();
+    } else {
+        budget = (long long)LPMaxRecordBytes();
+    }
+
+    @try {
+        if ([session respondsToSelector:@selector(setFileLengthLimit:)]) {
+            ((void (*)(id, SEL, long long))objc_msgSend)(session,
+                @selector(setFileLengthLimit:), budget);
+        }
+        if ([session respondsToSelector:@selector(setShouldOptimizeForNetworkUse:)]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(session,
+                @selector(setShouldOptimizeForNetworkUse:), YES);
+        }
+        LPLog(@"[media] export %.1fs → ngân sách %.1fMB", secs, budget / 1048576.0);
+    } @catch (__unused NSException *e) {}
+}
+
 static void LPApplyComposition(id session, NSString *ratioChoice) {
     if (!session) return;
     if (![[LPConfig shared] flag:@"frameRatioEnabled" fallback:YES]) return;
@@ -495,74 +531,94 @@ static void LPApplyComposition(id session, NSString *ratioChoice) {
     }
 }
 
-// _ExportStart @0x86b8 của mẫu: đọc associated object, nếu chưa xử lý thì
-// dispatch_async về main rồi mới gọi IMP gốc. Ta cấu hình ngay trên luồng gọi
-// (setVideoComposition: an toàn trước khi export chạy).
+// _ExportStart @0x86b8 của mẫu — đọc kỹ: nó KHÔNG gọi export gốc ngay.
+//
+//   86d8: getAssociatedObject(self, _kPrepare)  → nếu có
+//   86e8: getAssociatedObject(self, _kChoice)   → nếu có thì gọi export gốc luôn
+//   8724: setAssociatedObject(self, _kChoice, @"yes")
+//   8744: dispatch_async(main, _PrepareExport)
+//
+// _PrepareExport (block @0x9834) mới là chỗ làm việc:
+//   loadValuesAsynchronouslyForKeys:["tracks","duration"]
+//   → khi CẢ HAI có statusOfValueForKey == 2 (AVKeyValueStatusLoaded)
+//   → _FitComposition(asset, mode)  (mode: 0=auto, 1=1920x1080, 2=1080x1920)
+//   → setVideoComposition:
+//   → rồi mới gọi export gốc
+//
+// VÌ SAO PHẢI HOÃN: asset.duration và asset.tracks thường CHƯA load khi
+// exportAsynchronously được gọi. Đọc ngay thì duration = 0/NaN → dựng
+// composition hỏng, hoặc lặng lẽ bỏ qua. Đây là lỗi tôi đã mắc ở bản đầu.
 typedef void (^LPExportCompletion)(void);
+
+static const void *kLPPrepared = &kLPPrepared;
 
 static void LPExportAsync(id self, SEL _cmd, LPExportCompletion handler) {
     LPTrace("media.exportAsync");
     IMP o = LPOrigIMPFor(self, _cmd);
     if (!o) return;
 
-    // Đọc duration asset để quyết định ngân sách dung lượng.
-    double assetSecs = 0;
+    // Mỗi session chỉ chuẩn bị MỘT lần (mẫu dùng _kChoice cho việc này).
+    if (objc_getAssociatedObject(self, kLPPrepared)) {
+        ((void (*)(id, SEL, LPExportCompletion))o)(self, _cmd, handler);
+        return;
+    }
+    objc_setAssociatedObject(self, kLPPrepared, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    AVAsset *asset = nil;
     @try {
         if ([self respondsToSelector:@selector(asset)]) {
-            AVAsset *asset = ((id (*)(id, SEL))objc_msgSend)(self, @selector(asset));
-            if ([asset isKindOfClass:[AVAsset class]]) {
-                double d = CMTimeGetSeconds(asset.duration);
-                if (isfinite(d) && d > 0) assetSecs = d;
-            }
+            id a = ((id (*)(id, SEL))objc_msgSend)(self, @selector(asset));
+            if ([a isKindOfClass:[AVAsset class]]) asset = a;
         }
     } @catch (__unused NSException *e) {}
+
+    if (!asset) {
+        ((void (*)(id, SEL, LPExportCompletion))o)(self, _cmd, handler);
+        return;
+    }
 
     NSString *choice = [[LPConfig shared] str:@"frameRatioDefault" fallback:@"auto"];
 
-    if ([choice isEqualToString:@"ask"]) {
-        static BOOL askedThisSession = NO;
-        if (!askedThisSession) {
-            askedThisSession = YES;
-            __block BOOL started = NO;
-            LPAskRatio(^(NSString *picked) {
-                if (started) return;
-                started = YES;
-                LPApplyComposition(self, picked);
-                ((void (*)(id, SEL, LPExportCompletion))o)(self, _cmd, handler);
-            });
+    // Chốt chặn: nếu asset không bao giờ load xong (file hỏng, iCloud chưa tải),
+    // vẫn phải chạy export — không được treo.
+    __block BOOL started = NO;
+    void (^start)(void) = ^{
+        if (started) return;
+        started = YES;
+        ((void (*)(id, SEL, LPExportCompletion))o)(self, _cmd, handler);
+    };
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ start(); });
+
+    void (^proceed)(NSString *) = ^(NSString *picked) {
+        @try {
+            LPApplyComposition(self, picked);
+            LPApplyBudget(self, asset);
+        } @catch (__unused NSException *e) {}
+        dispatch_async(dispatch_get_main_queue(), ^{ start(); });
+    };
+
+    NSArray *keys = @[@"tracks", @"duration"];
+    [asset loadValuesAsynchronouslyForKeys:keys completionHandler:^{
+        BOOL ok = YES;
+        for (NSString *k in keys) {
+            if ([asset statusOfValueForKey:k error:NULL] != AVKeyValueStatusLoaded) {
+                ok = NO;
+                break;
+            }
+        }
+        if (!ok) {
+            LPLog(@"[media] asset chưa load xong — export không composition");
+            dispatch_async(dispatch_get_main_queue(), ^{ start(); });
             return;
         }
-        choice = @"auto";
-    }
-
-    LPApplyComposition(self, choice);
-
-    @try {
-        // Ngân sách dung lượng:
-        //   clip ngắn (≤ maxUploadSeconds)  → nén về maxUploadBytes (15MB)
-        //   video dài (quay 10 phút)        → trần quay maxRecordBytes (500MB)
-        // Nhờ vậy "quay 10 phút 500MB" và "up 60s 15MB" cùng đúng.
-        long long budget;
-        double shortLimit = LPUploadSeconds();
-        if (assetSecs > 0 && assetSecs <= shortLimit + 0.5 &&
-            [[LPConfig shared] flag:@"compressShortUploads" fallback:YES]) {
-            budget = (long long)LPUploadBytes();
+        if ([choice isEqualToString:@"ask"]) {
+            LPAskRatio(^(NSString *p) { proceed(p); });
         } else {
-            budget = (long long)LPMaxRecordBytes();
+            proceed(choice);
         }
-
-        SEL selLimit = @selector(setFileLengthLimit:);
-        if ([self respondsToSelector:selLimit]) {
-            ((void (*)(id, SEL, long long))objc_msgSend)(self, selLimit, budget);
-        }
-        if ([self respondsToSelector:@selector(setShouldOptimizeForNetworkUse:)]) {
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(self,
-                @selector(setShouldOptimizeForNetworkUse:), YES);
-        }
-        LPLog(@"[media] export %.1fs → ngân sách %.1fMB", assetSecs, budget / 1048576.0);
-    } @catch (__unused NSException *e) {}
-
-    ((void (*)(id, SEL, LPExportCompletion))o)(self, _cmd, handler);
+    }];
 }
 
 // Cắt bớt khi video dài hơn trần upload.
