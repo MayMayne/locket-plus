@@ -14,6 +14,10 @@
 //   - hook -[NSURLSession uploadTaskWithRequest:fromData:] → chữ ký block dễ sai,
 //     upload ảnh/video nào cũng đi qua đây.
 //
+// TUYỆT ĐỐI KHÔNG hook getter trả struct (CMTime, CMTimeRange, CGRect...):
+// arm64 trả struct >16 byte qua con trỏ ẩn ở x8, không phải tham số thứ 3.
+// Khai báo sai chữ ký = ghi vào thanh ghi rác = crash ngay.
+//
 // GIỚI HẠN THẬT CỦA LOCKET (đọc từ binary 2.68):
 //   * Quay: AVCaptureMovieFileOutput.maxRecordedDuration / maxRecordedFileSize  (client)
 //   * Chọn từ thư viện: PHPicker (KHÔNG dùng UIImagePickerController) → lọc bằng
@@ -83,15 +87,6 @@ static void LPPickerMaxDurSet(id self, SEL _cmd, double secs) {
     if (o) ((void (*)(id, SEL, double))o)(self, _cmd, LPVideoSeconds());
 }
 
-#pragma mark - ghi nhận giới hạn thật để chẩn đoán
-
-static void LPMovieMaxDurationGet(id self, SEL _cmd, void *ret) {
-    IMP o = LPOrigIMPFor(self, _cmd);
-    CMTime t = o ? ((CMTime (*)(id, SEL))o)(self, _cmd) : kCMTimeZero;
-    LPLog(@"[media] app đọc maxRecordedDuration = %.1fs", CMTimeGetSeconds(t));
-    *(CMTime *)ret = t;
-}
-
 #pragma mark - install
 
 void LPInstallMediaHooks(void) {
@@ -101,7 +96,6 @@ void LPInstallMediaHooks(void) {
     Class out = NSClassFromString(@"AVCaptureMovieFileOutput");
     LPMHook(out, @selector(setMaxRecordedDuration:), (IMP)LPMovieMaxDurationSet);
     LPMHook(out, @selector(setMaxRecordedFileSize:), (IMP)LPMovieMaxSizeSet);
-    LPMHook(out, @selector(maxRecordedDuration), (IMP)LPMovieMaxDurationGet);
 
     Class exp = NSClassFromString(@"AVAssetExportSession");
     LPMHook(exp, @selector(setTimeRange:), (IMP)LPExportTimeRangeSet);
