@@ -371,8 +371,6 @@ static void LPAskRatio(void (^done)(NSString *choice)) {
 // chèn objc_autoreleaseReturnValue lên một object +1 → over-release → crash.
 // (Đây là lý do bản v1.x chết; không phải "không được hook init".)
 static NSArray<NSString *> *LPPresetLadder(void) {
-    id v = [[LPConfig shared] obj];
-    (void)v;
     return @[@"AVAssetExportPreset1280x720",
              @"AVAssetExportPreset1920x1080"];
 }
