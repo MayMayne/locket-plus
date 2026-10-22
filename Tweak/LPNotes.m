@@ -306,6 +306,19 @@ static void LPNotesShowCompose(void) {
     });
 }
 
+// Lấy ngẫu nhiên n phần tử, không trùng.
+static NSArray<NSString *> *LPNotesSample(NSArray<NSString *> *src, NSUInteger n) {
+    if (!src.count || n == 0) return @[];
+    NSMutableArray *pool = [src mutableCopy];
+    NSMutableArray *out = [NSMutableArray array];
+    while (pool.count && out.count < n) {
+        NSUInteger i = arc4random_uniform((uint32_t)pool.count);
+        [out addObject:pool[i]];
+        [pool removeObjectAtIndex:i];
+    }
+    return out;
+}
+
 #pragma mark - thanh phụ trên bàn phím (thay cho menu)
 
 // Gắn một dải nút gợi ý ngay trên bàn phím khi người dùng gõ caption.
