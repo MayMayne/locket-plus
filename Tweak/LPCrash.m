@@ -173,6 +173,11 @@ void LPMarkBootOK(void) {
     [@"0" writeToFile:LPPath(@"crash.count") atomically:YES
              encoding:NSUTF8StringEncoding error:nil];
 
+    // Đánh dấu boot xong để watchdog không ghi hang.txt.
+    int fd = open([LPPath(@"boot.ok") fileSystemRepresentation],
+                  O_WRONLY | O_CREAT, 0644);
+    if (fd >= 0) close(fd);
+
     // Boot sạch trong safeMode: đếm. Đủ 2 lần sạch liên tiếp thì tự tắt
     // safeMode để lần sau chạy đầy đủ. Không tắt ngay sau 1 lần: nếu lỗi là
     // ngẫu nhiên theo thời điểm, tắt ngay sẽ quay lại vòng crash.

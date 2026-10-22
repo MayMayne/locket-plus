@@ -38,6 +38,8 @@
 #import <mach/vm_page_size.h>
 #import <dlfcn.h>
 #import <string.h>
+#import <unistd.h>
+#import <fcntl.h>
 
 #pragma mark - fishhook
 
@@ -282,6 +284,24 @@ static OSStatus LPDel(CFDictionaryRef q) {
 
 #pragma mark - app group container
 
+// Base của app group: <container>/Library/Shared/AppGroup
+// blatantsPatch dựng đúng đường dẫn này (_ContainerURL @0x474c:
+// NSSearchPathForDirectoriesInDomains(9=Library, 1=User, 1=YES) → "Shared/AppGroup").
+// Cache lại: hàm này bị gọi trong hook, KHÔNG được làm I/O mỗi lần.
+static NSString *LPSharedGroupBase(void) {
+    static NSString *base;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory,
+                                                            NSUserDomainMask, YES).firstObject;
+        if (!lib.length) lib = NSTemporaryDirectory();
+        base = [lib stringByAppendingPathComponent:@"Shared/AppGroup"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:base
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+    });
+    return base;
+}
+
 static NSURL *(*gOrigContainer)(id, SEL, NSString *);
 
 static NSURL *LPContainerURL(id self, SEL _cmd, NSString *groupID) {
@@ -312,42 +332,73 @@ static NSURL *LPContainerURL(id self, SEL _cmd, NSString *groupID) {
 
 #pragma mark - NSUserDefaults suite
 
-// blatantsPatch hook ĐÚNG selector private `_initWithSuiteName:container:`
-// (không phải `initWithSuiteName:`).
+// BÁM SÁT blatantsPatch @0x48a8 — GỌI IMP GỐC ĐÚNG MỘT LẦN.
 //
-// Private init này nhận thêm container; nếu container không tồn tại (app group
-// chưa có khi sideload) thì nó trả nil → mọi lần đọc/ghi defaults của app đi
-// vào hư không và có đường dẫn tới crash.
+// ĐÂY LÀ LỖI LÀM APP TREO NGAY KHI MỞ (log: 5 lần boot trong 21s, không lần nào
+// tới "[boot] sẵn sàng", crash.txt rỗng = bị giết vì TREO, không phải crash):
 //
-// Cách của mẫu: thay container bằng thư mục thay thế có thật, rồi gọi init gốc.
-// KHÔNG trả standardUserDefaults — làm vậy là trộn dữ liệu app với app group,
-// và trả về object khác class mà caller mong đợi.
+//   SAI (bản v5.0–v5.5): gọi orig TRƯỚC để "thử", nếu nil thì gọi orig LẦN NỮA
+//   với path thay thế. Gọi -init hai lần trên CÙNG một object: lần đầu đăng ký
+//   domain với CFPreferences, lần hai chạy lại setup trên object đã setup →
+//   deadlock. Không sinh crash.txt vì không phải crash.
+//
+//   ĐÚNG (mẫu): kiểm điều kiện TRƯỚC, rồi gọi orig một lần duy nhất.
+//     if (appGroupPath && [suite hasPrefix:@"group"])
+//         container = [appGroupPath stringByAppendingPathComponent:suite];
+//     return orig(self, _cmd, suite, container);
 static id (*gOrigSuiteContainer)(id, SEL, NSString *, id);
 
 static id LPInitSuiteContainer(id self, SEL _cmd, NSString *suite, id container) {
     if (!gOrigSuiteContainer) return nil;
 
-    // Thử nguyên bản trước — app group có thật thì không can thiệp.
-    id r = gOrigSuiteContainer(self, _cmd, suite, container);
-    if (r) return r;
-
-    NSString *groupID = nil;
-    if ([suite isKindOfClass:[NSString class]] && [suite containsString:@"locket"]) {
-        groupID = suite;
-    } else if ([container isKindOfClass:[NSString class]] &&
-               [container containsString:@"locket"]) {
-        groupID = container;
+    if (![[LPConfig shared] flag:@"sideloadSuiteHook" fallback:YES]) {
+        return gOrigSuiteContainer(self, _cmd, suite, container);
     }
-    if (!groupID.length) return nil;
 
-    NSString *path = LPGroupPathFor(groupID);
-    if (!path.length) return nil;
+    @try {
+        NSString *base = LPSharedGroupBase();
+        if (base.length &&
+            [suite isKindOfClass:[NSString class]] &&
+            [suite hasPrefix:@"group"]) {
+            NSString *p = [base stringByAppendingPathComponent:suite];
+            if (p.length) {
+                static BOOL logged = NO;
+                if (!logged) {
+                    logged = YES;
+                    LPLog(@"[sideload] suite %@ container → %@", suite, p);
+                }
+                return gOrigSuiteContainer(self, _cmd, suite, p);
+            }
+        }
+    } @catch (__unused NSException *e) {}
 
-    LPLog(@"[sideload] suite %@ container nil → %@", suite, path);
-    return gOrigSuiteContainer(self, _cmd, suite, path);
+    return gOrigSuiteContainer(self, _cmd, suite, container);
 }
 
 #pragma mark - install
+
+// Watchdog: nếu app không tới được LPMarkBootOK trong 8 giây, ghi lại mốc cuối
+// cùng đã chạy. Lần sau đọc log là biết treo ở đâu — không phải đoán.
+// Chạy trên thread riêng, chỉ dùng POSIX.
+static void LPWatchdogStart(void) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        for (int i = 0; i < 16; i++) {
+            usleep(500 * 1000);              // 16 × 0.5s = 8s
+            NSString *mark = LPPath(@"boot.ok");
+            if ([[NSFileManager defaultManager] fileExistsAtPath:mark]) return;
+        }
+        // Chưa boot xong sau 8s → ghi dấu hiệu treo.
+        NSString *p = LPPath(@"hang.txt");
+        int fd = open([p fileSystemRepresentation],
+                      O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd >= 0) {
+            const char *s = "treo: khong toi duoc LPMarkBootOK trong 8s\n";
+            ssize_t w = write(fd, s, strlen(s));
+            (void)w;
+            close(fd);
+        }
+    });
+}
 
 void LPInstallSideloadFixes(void) {
     if (![[LPConfig shared] flag:@"sideloadFix" fallback:YES]) {

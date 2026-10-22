@@ -6,6 +6,13 @@
 #import <objc/message.h>
 #import <sys/stat.h>
 #import <stdarg.h>
+#import <pthread.h>
+#import <unistd.h>
+#import <fcntl.h>
+#import <time.h>
+#import <stdio.h>
+#import <stdlib.h>
+#import <sys/stat.h>
 
 static LPConfig *gConfig;
 
@@ -75,8 +82,22 @@ static LPConfig *gConfig;
 }
 - (id)obj:(NSString *)key { return key ? self.plist[key] : nil; }
 
-// Ghi log có khoá. Hook chạy trên main / network / capture thread cùng lúc;
-// ghi file không khoá là crash (đúng lỗi v1.13).
+// Ghi log — CHỈ POSIX, KHÔNG Foundation.
+//
+// ĐÂY LÀ NGUYÊN NHÂN TREO (log: 5 lần boot / 21s, không lần nào tới
+// "[boot] sẵn sàng", crash.txt rỗng = bị giết vì treo, không phải crash):
+//
+//   NSDateFormatter khi chưa set locale sẽ ĐỌC locale từ NSUserDefaults.
+//   Tôi gọi LPLog từ trong hook `_initWithSuiteName:container:`, tức là đang
+//   ở giữa lúc NSUserDefaults khởi tạo → NSDateFormatter lại gọi vào
+//   NSUserDefaults → DEADLOCK. App đứng im, watchdog giết, không có crash log.
+//
+// Giờ: time() + gmtime_r + snprintf + open/write/close. Không chạm Foundation,
+// nên gọi từ bất kỳ hook nào cũng an toàn.
+static pthread_mutex_t gLogMutex;
+static char gLogPath[512];
+static off_t gLogSize = 0;
+
 + (void)log:(NSString *)fmt, ... {
     va_list ap;
     va_start(ap, fmt);
@@ -84,34 +105,47 @@ static LPConfig *gConfig;
     va_end(ap);
     if (!msg.length) return;
 
-    static NSLock *lock;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ lock = [NSLock new]; });
+    const char *utf8 = msg.UTF8String;
+    if (!utf8) return;
 
-    [lock lock];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        pthread_mutexattr_t attr;
+        pthread_mutexattr_init(&attr);
+        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&gLogMutex, &attr);
+        pthread_mutexattr_destroy(&attr);
+
+        NSString *dir = LPDir();
+        snprintf(gLogPath, sizeof(gLogPath), "%s/log.txt", dir.UTF8String);
+    });
+
+    pthread_mutex_lock(&gLogMutex);
     @try {
-        NSString *p = LPPath(@"log.txt");
-        NSDateFormatter *df = [[NSDateFormatter alloc] init];
-        df.dateFormat = @"HH:mm:ss.SSS";
-        NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
-                          [df stringFromDate:[NSDate date]], msg];
-        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
-        if (!fh) {
-            [d writeToFile:p atomically:YES];
-        } else {
-            @try {
-                [fh seekToEndOfFile];
-                [fh writeData:d];
-                [fh closeFile];
-            } @catch (__unused NSException *e) {}
+        if (gLogSize > 384 * 1024) {
+            unlink(gLogPath);
+            gLogSize = 0;
         }
-        struct stat st;
-        if (stat([p fileSystemRepresentation], &st) == 0 && st.st_size > 384 * 1024) {
-            [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
-        }
+
+        char line[1024];
+        time_t t = time(NULL);
+        struct tm tmv;
+        gmtime_r(&t, &tmv);
+        // Giờ VN = UTC+7; log để giờ máy cho dễ đối chiếu.
+        tmv.tm_hour = (tmv.tm_hour + 7) % 24;
+
+        int n = snprintf(line, sizeof(line), "[%02d:%02d:%02d] %s\n",
+                         tmv.tm_hour, tmv.tm_min, tmv.tm_sec, utf8);
+        if (n < 0) return;
+        if (n >= (int)sizeof(line)) n = (int)sizeof(line) - 1;
+
+        int fd = open(gLogPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (fd < 0) return;
+        ssize_t w = write(fd, line, (size_t)n);
+        if (w > 0) gLogSize += w;
+        close(fd);
     } @catch (__unused NSException *e) {}
-    [lock unlock];
+    pthread_mutex_unlock(&gLogMutex);
 }
 
 + (NSString *)logText {
@@ -123,18 +157,24 @@ static LPConfig *gConfig;
 
 #pragma mark - đường dẫn
 
+// Cache đường dẫn bằng POSIX. KHÔNG gọi NSFileManager/createDirectory ở đây:
+// LPDir() được gọi từ trong hook NSUserDefaults (qua LPLog), và
+// NSSearchPathForDirectoriesInDomains → NSUserDefaults → hook → LPDir → ...
+// là một vòng đệ quy có thể deadlock.
 NSString *LPDir(void) {
-    static NSString *dir;
+    static char buf[512];
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSString *d = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                          NSUserDomainMask, YES).firstObject;
-        if (!d.length) d = NSTemporaryDirectory();
-        dir = [d stringByAppendingPathComponent:@"LocketPlus"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        // getenv("HOME") = container của app, không cần Foundation.
+        const char *home = getenv("HOME");
+        if (home && *home) {
+            snprintf(buf, sizeof(buf), "%s/Documents/LocketPlus", home);
+            mkdir(buf, 0755);
+        } else {
+            snprintf(buf, sizeof(buf), "%s", NSTemporaryDirectory().UTF8String ?: "/tmp");
+        }
     });
-    return dir;
+    return [NSString stringWithUTF8String:buf];
 }
 
 NSString *LPPath(NSString *name) {
@@ -142,19 +182,36 @@ NSString *LPPath(NSString *name) {
 }
 
 // blatantsPatch dựng thư mục thay thế cho app group dưới
-// <ApplicationSupport>/../Shared/AppGroup/<groupID> — tức <container>/Library/Shared/AppGroup/…
+// <container>/Library/Shared/AppGroup/<groupID>.
 // Đường dẫn phải ỔN ĐỊNH giữa các lần chạy, nếu đổi thì dữ liệu cũ mất.
+//
+// CHỈ POSIX. Hàm này được gọi TỪ TRONG hook containerURL, mà hook đó có thể
+// chạy giữa lúc NSUserDefaults đang khởi tạo. Gọi
+// NSSearchPathForDirectoriesInDomains hay NSFileManager ở đây có thể quay lại
+// NSUserDefaults → đệ quy → treo. getenv("HOME") + mkdir không chạm Foundation.
 NSString *LPGroupPathFor(NSString *groupID) {
     if (![groupID isKindOfClass:[NSString class]] || !groupID.length) return nil;
-    NSString *base = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory,
-                                                         NSUserDomainMask, YES).firstObject;
-    if (!base.length) base = NSTemporaryDirectory();
-    NSString *shared = [[base stringByAppendingPathComponent:@"../Shared/AppGroup"]
-                        stringByStandardizingPath];
-    NSString *dir = [shared stringByAppendingPathComponent:groupID];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir
-                              withIntermediateDirectories:YES attributes:nil error:nil];
-    return dir;
+
+    static char base[512];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *home = getenv("HOME");
+        if (home && *home) {
+            snprintf(base, sizeof(base), "%s/Library/Shared/AppGroup", home);
+        } else {
+            snprintf(base, sizeof(base), "%s", NSTemporaryDirectory().UTF8String ?: "/tmp");
+        }
+        mkdir(base, 0755);
+    });
+
+    const char *gid = groupID.UTF8String;
+    if (!gid) return nil;
+
+    char full[1024];
+    snprintf(full, sizeof(full), "%s/%s", base, gid);
+    mkdir(full, 0755);
+
+    return [NSString stringWithUTF8String:full];
 }
 
 #pragma mark - giới hạn
@@ -300,21 +357,30 @@ BOOL LPHookMethodTyped(Class cls, SEL sel, const char *expectReturn,
 
 // Chờ class nạp muộn (Swift class của Locket, RevenueCat…). Tối đa 20s,
 // kiểm mỗi 250ms trên main queue. Block chạy ĐÚNG 1 lần.
+//
+// Dùng dispatch_after lặp lại thay vì vòng while + sleep: block trên main
+// queue mà sleep là chặn UI, app trông như treo.
 void LPWhenClassReady(NSString *name, void (^block)(Class cls)) {
     if (!name.length || !block) return;
 
     __block BOOL done = NO;
     __block int tries = 0;
 
-    void (^poll)(void) = ^{
+    __block void (^poll)(void) = nil;
+    void (^pollImpl)(void) = ^{
         if (done) return;
         Class c = NSClassFromString(name);
-        if (c) { done = YES; @try { block(c); } @catch (NSException *e) {
-            LPLog(@"[hook] block %@ lỗi: %@", name, e.reason); } return; }
+        if (c) {
+            done = YES;
+            @try { block(c); }
+            @catch (NSException *e) { LPLog(@"[hook] block %@ lỗi: %@", name, e.reason); }
+            return;
+        }
         if (++tries > 80) return;                 // 80 × 250ms = 20s
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(250 * NSEC_PER_MSEC)),
                        dispatch_get_main_queue(), poll);
     };
+    poll = [pollImpl copy];
     dispatch_async(dispatch_get_main_queue(), poll);
 }
 

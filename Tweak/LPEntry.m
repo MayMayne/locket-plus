@@ -40,7 +40,7 @@ static void LPInit(void) {
         @try {
             LPInstallCrashHandler();
             LPBootBegin();
-            LPLog(@"[boot] LocketPlus v5.0 nạp");
+            LPLog(@"[boot] LocketPlus v5.6 nạp");
         } @catch (__unused NSException *e) {}
 
         // 3: keychain/app-group — phải xong trước Firebase Auth.
@@ -50,6 +50,9 @@ static void LPInit(void) {
         } else {
             LPLog(@"[boot] safeMode — bỏ qua sideload fix");
         }
+
+        // Watchdog: ghi hang.txt nếu 8s sau vẫn chưa boot xong.
+        @try { LPWatchdogStart(); } @catch (__unused NSException *e) {}
 
         // 4: phần còn lại sau khi app lên.
         dispatch_async(dispatch_get_main_queue(), ^{
