@@ -75,7 +75,7 @@ static void LPBoot(void) {
     @try { LPInstallNotesAccessory(); } @catch (NSException *e) { LPLog(@"[boot] notes: %@", e); }
     @try { LPInstallProfileHook(); }  @catch (NSException *e) { LPLog(@"[boot] profile: %@", e); }
 
-    LPLog(@"[boot] Locket+ v1.8 sẵn sàng (không menu)");
+    LPLog(@"[boot] Locket+ v1.9 sẵn sàng (không menu)");
 }
 
 __attribute__((constructor))

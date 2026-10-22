@@ -98,6 +98,11 @@ NSURL *LPExportVideoWithRatio(NSURL *srcURL, NSString *ratio, NSError **outErr) 
     AVMutableVideoCompositionLayerInstruction *layer =
         [AVMutableVideoCompositionLayerInstruction videoCompositionLayerInstructionWithAssetTrack:vComp];
 
+    // KHÔNG dùng setAppliesPreferredTrackTransform:YES ở đây: nó và
+    // setTransform:atTime: ghi đè lẫn nhau. Khi cần letterbox (tỉ lệ khác
+    // original) ta phải tự dựng ma trận; khi giữ original thì set transform
+    // gốc bên dưới là đủ.
+
     // Xử lý hướng quay: transform ưu tiên của track có thể xoay 90°.
     CGAffineTransform t = vTrack.preferredTransform;
     CGSize rotated = CGSizeApplyAffineTransform(natural, t);
@@ -148,6 +153,9 @@ NSURL *LPExportVideoWithRatio(NSURL *srcURL, NSString *ratio, NSError **outErr) 
     ex.outputURL = outURL;
     ex.outputFileType = AVFileTypeMPEG4;
     ex.shouldOptimizeForNetworkUse = YES;
+    // 2 cờ này giúp export video dài/500MB không bị fail giữa đường:
+    // cho phép đọc lại source nhiều lượt + không giới hạn dung lượng tạm.
+    ex.canPerformMultiplePassesOverSourceMediaData = YES;
     if (target > 0) ex.videoComposition = vc;
 
     // Chờ đồng bộ có timeout: treo app 120s còn hơn treo vĩnh viễn.
@@ -208,10 +216,45 @@ static void LPSetTimeRange(id self, SEL _cmd, CMTimeRange r) {
     ((void (*)(id, SEL, CMTimeRange))o)(self, _cmd, r);
 }
 
+#pragma mark - ghi nhận dung lượng upload thật
+
+// GTMSessionFetcher là lớp Firebase Storage dùng để upload. Hook ĐÚNG selector
+// beginFetchWithCompletionHandler: (KHÔNG phải startWithCompletionHandler: —
+// selector đó không tồn tại, hook vào là no-op hoặc crash).
+// Ở đây chỉ đọc request để biết server sẽ nhận bao nhiêu byte.
+static void (*gOrigFetchBegin)(id, SEL, id);
+static void LPFetchBegin(id self, SEL _cmd, id completion) {
+    @try {
+        NSURLRequest *req = nil;
+        if ([self respondsToSelector:@selector(request)]) req = [self performSelector:@selector(request)];
+        if (req.URL) {
+            long long body = (long long)req.HTTPBody.length;
+            NSString *len = [req valueForHTTPHeaderField:@"Content-Length"];
+            if (len.length) body = len.longLongValue;
+            LPLog(@"[upload] %@ %@ %lld bytes (%.1fMB)",
+                  req.HTTPMethod, req.URL.path, body, body / 1048576.0);
+            if (body > (long long)LPVideoBytes()) {
+                LPLog(@"[upload] VƯỢT trần client %.0fMB — server có thể từ chối",
+                      LPVideoBytes() / 1048576.0);
+            }
+        }
+    } @catch (__unused NSException *e) {}
+    if (gOrigFetchBegin) ((void (*)(id, SEL, id))gOrigFetchBegin)(self, _cmd, completion);
+}
+
 void LPInstallExportHooks(void) {
     Class ex = NSClassFromString(@"AVAssetExportSession");
     if (!ex) { LPLog(@"[export] không có AVAssetExportSession"); return; }
     LPHookMethod(ex, @selector(setFileLengthLimit:), (IMP)LPSetFileLengthLimit, (IMP *)&gOrigFileLimit);
     LPHookMethod(ex, @selector(setTimeRange:), (IMP)LPSetTimeRange, (IMP *)&gOrigTimeRange);
-    LPLog(@"[export] hook xong (limit + timeRange)");
+
+    // GTMSessionFetcher nạp muộn (Firebase) → chờ class xuất hiện.
+    LPWhenClassReady(@"GTMSessionFetcher", ^(Class cls) {
+        if (LPHookMethod(cls, @selector(beginFetchWithCompletionHandler:),
+                         (IMP)LPFetchBegin, (IMP *)&gOrigFetchBegin)) {
+            LPLog(@"[export] hook GTMSessionFetcher.beginFetch (log dung lượng)");
+        }
+    });
+
+    LPLog(@"[export] hook xong (limit + timeRange + upload log)");
 }

@@ -64,7 +64,8 @@ static UIImage *LPImageNamed(NSString *name) {
 @property (nonatomic, strong) UILabel *nameLabel, *quoteLabel, *songLabel, *lyricsLabel, *badgeLabel;
 @property (nonatomic, strong) UIStackView *featuredStack, *friendsStack;
 @property (nonatomic, copy) NSString *pickerTarget;   // cover / avatar / featured / coverVideo
-@property (nonatomic, strong) AVPlayer *coverPlayer;
+@property (nonatomic, strong) AVQueuePlayer *coverPlayer;
+@property (nonatomic, strong) AVPlayerLooper *coverLooper;
 @property (nonatomic, strong) AVPlayerLayer *coverLayer;
 @end
 
@@ -388,12 +389,10 @@ static UIImage *LPImageNamed(NSString *name) {
 }
 
 - (void)refreshCoverVideo {
-    // reload() gọi hàm này mỗi lần sửa profile → phải bỏ observer cũ trước,
-    // nếu không sẽ có N observer và coverVideoEnded: chạy N lần.
-    [[NSNotificationCenter defaultCenter] removeObserver:self
-                                                    name:AVPlayerItemDidPlayToEndTimeNotification
-                                                  object:nil];
+    // reload() gọi hàm này mỗi lần sửa profile → phải dọn player cũ trước.
     [self.coverPlayer pause];
+    [self.coverLooper disableLooping];
+    self.coverLooper = nil;
     [self.coverLayer removeFromSuperlayer];
     self.coverPlayer = nil;
     self.coverLayer = nil;
@@ -402,26 +401,18 @@ static UIImage *LPImageNamed(NSString *name) {
     NSURL *u = [NSURL fileURLWithPath:[LPConfig path:self.model.coverVideoName]];
     if (![[NSFileManager defaultManager] fileExistsAtPath:u.path]) return;
 
+    // AVPlayerLooper lặp mượt, không có khoảng hụt như seek về 0 thủ công.
+    // (Cách MHProfileVideo.dylib đang dùng.)
     AVPlayerItem *item = [AVPlayerItem playerItemWithURL:u];
-    self.coverPlayer = [AVPlayer playerWithPlayerItem:item];
-    self.coverPlayer.muted = YES;                       // bìa không được phát tiếng
-    self.coverPlayer.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+    self.coverPlayer = [AVQueuePlayer queuePlayerWithItems:@[item]];
+    self.coverPlayer.muted = YES;                       // bìa không phát tiếng
+    self.coverLooper = [AVPlayerLooper playerLooperWithPlayer:self.coverPlayer templateItem:item];
 
     self.coverLayer = [AVPlayerLayer playerLayerWithPlayer:self.coverPlayer];
     self.coverLayer.frame = self.coverView.bounds;
     self.coverLayer.videoGravity = AVLayerVideoGravityResizeAspectFill;
     [self.coverView.layer addSublayer:self.coverLayer];
 
-    // Lặp vô hạn: AVPlayer không có loop sẵn, phải tự seek về 0 khi hết.
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(coverVideoEnded:)
-                                                 name:AVPlayerItemDidPlayToEndTimeNotification
-                                               object:item];
-    [self.coverPlayer play];
-}
-
-- (void)coverVideoEnded:(NSNotification *)n {
-    [self.coverPlayer seekToTime:kCMTimeZero];
     [self.coverPlayer play];
 }
 
