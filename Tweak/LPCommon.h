@@ -30,6 +30,7 @@
 #pragma mark - cấu hình
 
 @interface LPConfig : NSObject
+@property (nonatomic, strong) NSDictionary *plist;
 + (instancetype)shared;
 - (void)reload;
 - (BOOL)flag:(NSString *)key fallback:(BOOL)fb;
@@ -75,6 +76,7 @@ void LPInstallNetHooks(void);
 #pragma mark - các module
 
 void LPInstallCrashHandler(void);
+void LPWriteCrashText(NSString *text);
 void LPBootBegin(void);
 void LPMarkBootOK(void);
 void LPTrace(const char *what);
