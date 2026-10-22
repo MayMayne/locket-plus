@@ -99,7 +99,7 @@ static void LPBoot(void) {
     // 8 giây sau mà app còn sống → boot thành công, lần sau không bật safeMode.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ LPMarkBootOK(); });
-    LPLog(@"[boot] Locket+ v1.12 sẵn sàng (không menu)");
+    LPLog(@"[boot] Locket+ v1.13 sẵn sàng (không menu)");
 }
 
 __attribute__((constructor))

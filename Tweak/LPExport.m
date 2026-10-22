@@ -10,6 +10,7 @@
 
 #import "LPCommon.h"
 #import <AVFoundation/AVFoundation.h>
+#import <objc/message.h>
 
 #pragma mark - tỉ lệ
 
@@ -282,7 +283,9 @@ static void (*gOrigFetchBegin)(id, SEL, id);
 static void LPFetchBegin(id self, SEL _cmd, id completion) {
     @try {
         NSURLRequest *req = nil;
-        if ([self respondsToSelector:@selector(request)]) req = [self performSelector:@selector(request)];
+        if ([self respondsToSelector:@selector(request)]) {
+            req = ((id (*)(id, SEL))objc_msgSend)(self, @selector(request));
+        }
         if (req.URL) {
             long long body = (long long)req.HTTPBody.length;
             NSString *len = [req valueForHTTPHeaderField:@"Content-Length"];
@@ -305,11 +308,15 @@ void LPInstallExportHooks(void) {
     LPHookMethod(ex, @selector(setTimeRange:), (IMP)LPSetTimeRange, (IMP *)&gOrigTimeRange);
 
     // GTMSessionFetcher nạp muộn (Firebase) → chờ class xuất hiện.
+    // Bọc @try: nếu class đang được khởi tạo dở, method_getImplementation
+    // có thể ném; không bọc là chết app.
     LPWhenClassReady(@"GTMSessionFetcher", ^(Class cls) {
-        if (LPHookMethod(cls, @selector(beginFetchWithCompletionHandler:),
-                         (IMP)LPFetchBegin, (IMP *)&gOrigFetchBegin)) {
-            LPLog(@"[export] hook GTMSessionFetcher.beginFetch (log dung lượng)");
-        }
+        @try {
+            if (LPHookMethodTyped(cls, @selector(beginFetchWithCompletionHandler:), "v",
+                                  (IMP)LPFetchBegin, (IMP *)&gOrigFetchBegin)) {
+                LPLog(@"[export] hook GTMSessionFetcher.beginFetch");
+            }
+        } @catch (NSException *e) { LPLog(@"[export] fetch hook lỗi: %@", e); }
     });
 
     LPLog(@"[export] hook xong (limit + timeRange + upload log)");

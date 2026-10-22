@@ -50,18 +50,35 @@ static LPConfig *gConfig;
     va_list ap; va_start(ap, fmt);
     NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSDateFormatter *df = [NSDateFormatter new];
-    df.dateFormat = @"HH:mm:ss.SSS";
-    NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
-    NSString *p = [LPConfig path:@"log.txt"];
-    NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
-    if (!fh) { [d writeToFile:p atomically:YES]; return; }
-    @try { [fh seekToEndOfFile]; [fh writeData:d]; [fh closeFile]; } @catch (__unused NSException *e) {}
-    struct stat st;
-    if (stat([p fileSystemRepresentation], &st) == 0 && st.st_size > 512 * 1024) {
-        [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
-    }
+
+    // Thread-safe: hook chạy trên nhiều thread (network, main, capture).
+    // Ghi file không khoá = crash. Dùng lock tĩnh + formatter dùng lại.
+    static NSLock *lock;
+    static NSDateFormatter *df;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        lock = [NSLock new];
+        df = [NSDateFormatter new];
+        df.dateFormat = @"HH:mm:ss.SSS";
+    });
+
+    [lock lock];
+    @try {
+        NSString *line = [NSString stringWithFormat:@"[%@] %@\n", [df stringFromDate:[NSDate date]], msg];
+        NSString *p = [LPConfig path:@"log.txt"];
+        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+        if (!fh) { [d writeToFile:p atomically:YES]; }
+        else {
+            @try { [fh seekToEndOfFile]; [fh writeData:d]; [fh closeFile]; }
+            @catch (__unused NSException *e) {}
+        }
+        struct stat st;
+        if (stat([p fileSystemRepresentation], &st) == 0 && st.st_size > 512 * 1024) {
+            [[NSFileManager defaultManager] removeItemAtPath:p error:nil];
+        }
+    } @catch (__unused NSException *e) {}
+    [lock unlock];
 }
 
 + (NSString *)logText {
