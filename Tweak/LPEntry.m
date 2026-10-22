@@ -123,7 +123,7 @@ static void LPBoot(void) {
     @try { LPApplyConfiguredPatches(); } @catch (NSException *e) { LPLog(@"[boot] patch lỗi: %@", e); }
     @try { LPInstallProfileHook(); } @catch (NSException *e) { LPLog(@"[boot] profile lỗi: %@", e); }
     @try { LPInstallFab(); } @catch (NSException *e) { LPLog(@"[boot] fab lỗi: %@", e); }
-    LPLog(@"[boot] Locket+ v1.6 sẵn sàng");
+    LPLog(@"[boot] Locket+ v1.7 sẵn sàng");
 }
 
 __attribute__((constructor))
