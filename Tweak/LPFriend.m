@@ -142,7 +142,16 @@ static void LPFetchAppCheckToken(void (^done)(NSString *, NSString *)) {
 
 #pragma mark - replay
 
+// Cờ chống đệ quy: replay đi qua CÙNG hook (hook gắn ở class, không phải
+// instance — session riêng KHÔNG tránh được). Không có cờ này thì mỗi replay
+// lại sinh thêm 1 log + 1 lần xử lý. gAuthRecovered đã chặn replay lần 2,
+// nhưng cờ này chặn luôn cả việc xử lý response của chính replay.
+static volatile int gInReplay = 0;
+
 static void LPReplay(NSURLRequest *original, NSString *idToken, NSString *acToken) {
+    if (gInReplay) return;
+    gInReplay = 1;
+
     NSMutableURLRequest *req = [original mutableCopy];
     if (idToken) [req setValue:[@"Bearer " stringByAppendingString:idToken]
             forHTTPHeaderField:@"Authorization"];
@@ -151,17 +160,26 @@ static void LPReplay(NSURLRequest *original, NSString *idToken, NSString *acToke
     LPFriendAdd([NSString stringWithFormat:@"[replay] %@ %@",
                  req.HTTPMethod, req.URL.path]);
 
-    // Session riêng, ephemeral: replay KHÔNG bị hook của chính mình bắt lại
-    // (nếu bắt lại → vòng lặp vô hạn).
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
     NSURLSession *s = [NSURLSession sessionWithConfiguration:cfg];
+
+    // Lưới an toàn: nếu completion không bao giờ chạy (session bị huỷ, app vào
+    // background), cờ sẽ kẹt ở 1 và chặn mọi replay sau. Tự nhả sau 30s.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(30.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (gInReplay) { gInReplay = 0; LPLog(@"[friend] nhả cờ replay (timeout)"); }
+    });
+
     [[s dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
         NSInteger code = [(NSHTTPURLResponse *)resp statusCode];
         LPFriendAdd([NSString stringWithFormat:@"[replay] → HTTP %ld body=%@ err=%@",
                      (long)code, LPTrunc(data, 800), err.localizedDescription ?: @"-"]);
         if (code == 403) {
             LPFriendAdd(@"[replay] 403 vẫn còn → App Check/attestation. Hết đường ở client.");
+        } else if (code == 200 || code == 201) {
+            LPFriendAdd(@"[replay] 200 → kết bạn THÀNH CÔNG sau khi refresh token");
         }
+        gInReplay = 0;
         [s finishTasksAndInvalidate];
     }] resume];
 }
@@ -249,6 +267,7 @@ static void LPObserveFetcherNotifications(void) {
 void LPInstallFriendNetProcessor(void) {
     LPAddNetProcessor(^(NSURLRequest *req, LPNetResult *res) {
         @try {
+            if (gInReplay) return;              // response của chính replay
             if (!LPFriendURL(req.URL)) return;
             LPHandleFriendResponse(req, res.data, res.response, nil);
         } @catch (NSException *e) { LPLog(@"[friend] lỗi: %@", e.reason); }
