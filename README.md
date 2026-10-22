@@ -104,3 +104,78 @@ Bản README trước ghi 4 điều **sai** về dylib mẫu. Sau khi đọc l�
 Vì vậy `LocketPlus` giờ làm **cả hai**, tách bằng config: mặc định nâng trần (600s/500MB) như bạn yêu cầu; bật `compressForUpload` thì chuyển sang chiến lược nén của dylib mẫu.
 
 Bài học: đừng suy ra hành vi từ tên hằng số. `600` trong một `CMTime` là **timescale**, không phải số giây.
+
+
+## v2.1 — sửa 5 lỗi thật gây crash (đọc từ log thật)
+
+Log của bạn cho thấy 3 sự thật quan trọng:
+
+```
+[net] hook 10 method trên 6 class     <- hook quá rộng
+crash.txt rỗng (không stack trace)    <- handler chết trong handler
+[23:21:18] [boot] sẵn sàng            <- boot XONG rồi mới chết
+[23:21:21] (chết)                     <- ~3s sau, không đều
+```
+
+### 1. Lỗi gốc: `LPHookMethod` sửa Method của CLASS CHA
+
+Đây là lỗi nghiêm trọng nhất, và nó giải thích tại sao 4 dylib mẫu chạy được còn của tôi thì không.
+
+```objc
+// SAI (bản cũ của tôi)
+Method m = class_getInstanceMethod(cls, sel);   // ĐI LÊN class cha nếu cls không tự cài
+method_setImplementation(m, newImp);            // sửa Method của CHA
+// => MỌI subclass đều chạy qua code của tôi
+```
+
+```objc
+// ĐÚNG (cả 2 dylib mẫu đều làm thế)
+// _Hook @0x8364 (MHVideoPipeline), _ObserveMethod @0x4570 (blatantsPatch)
+duyệt class_copyMethodList để biết class nào SỞ HỮU method:
+  owner == cls  -> method_setImplementation
+  owner != cls  -> class_addMethod lên cls   (class cha KHÔNG bị đụng)
+```
+
+Với `NSURLSession` (class cluster), bản cũ của tôi còn quét **6 class** và hook **10 method** — gồm cả class private của hệ thống. Mỗi response trong app đều chạy qua code tweak. `AutoRcSideload` hook **đúng 1 class, 2 selector**.
+
+### 2. Crash handler không ghi được gì
+
+Handler cũ dùng `NSMutableString` + `writeToFile:` — Foundation trong signal handler có thể chết (heap hỏng, lock bị giữ) → `crash.txt` chỉ còn template. Giờ dùng `open`/`read`/`write`/`snprintf` thuần POSIX.
+
+### 3. `__got` KHÔNG phải con trỏ PAC
+
+Bản cũ bỏ qua cả `__got` trên arm64e với lý do "con trỏ PAC" → sideload fix không đầy đủ. Sự thật: chỉ **`__auth_got`** là con trỏ đã ký PAC. `blatantsPatch` vá `__got` và chạy được.
+
+### 4. Bỏ 2 thứ tôi tự bịa (không dylib mẫu nào làm)
+
+| Bỏ | Vì sao |
+|---|---|
+| `LPRemoteConfig` | Hook `boolValue`/`numberValue`/`integerValue`/`stringValue` của **mọi** lần đọc Remote Config trong app. Không mẫu nào làm. Bề mặt crash cực lớn |
+| Hook `RCEntitlementInfos` / `RCCustomerInfo` | `AutoRcSideload` chỉ rewrite JSON, không hook class. Value của `.all`/`.active` là object thật; nhân bản dưới nhiều key có thể làm SDK so sánh `identifier != key` |
+
+### 5. `NSUserDefaults`: hook đúng selector private
+
+`blatantsPatch` hook **`_initWithSuiteName:container:`**, không phải `initWithSuiteName:`. Và nó **thay container** bằng thư mục thật — không trả `standardUserDefaults` (làm vậy là trộn dữ liệu app với app-group, và trả object khác class caller mong đợi).
+
+### 6. Không dùng KVC
+
+`MHProfileSupport._FetcherFinished` (@0xd4f0) kiểm `respondsToSelector:` **trước mọi lệnh gửi**. Bản cũ của tôi dùng `[fetcher valueForKey:@"request"]` → `NSUnknownKeyException` chờ xảy ra.
+
+## Nếu vẫn crash
+
+Giờ có thêm công cụ để khoanh vùng. Trong `Documents/LocketPlus/`:
+
+- **`live.trace`** — ghi từng bước hook chạy (net.completion, media.maxDuration…). Crash xảy ra sau boot thì file này cho biết đang ở đâu.
+- **`crash.txt`** — giờ có stack trace thật (địa chỉ).
+- **`boot.trace`** — bước boot cuối.
+
+Và tắt từng module trong `config.plist` để khoanh vùng:
+
+| Key | Tắt gì |
+|---|---|
+| `mediaEnabled` | Toàn bộ hook video |
+| `goldUnlock` | Gold + xoá cache |
+| `friendDiagnostics` | Chẩn đoán kết bạn + GTMSessionFetcher observer |
+| `safeMode` | Tất cả |
+
+Cách nhanh nhất: bật `safeMode` (chắc chắn mở được app), rồi bật lại **một** module mỗi lần.
