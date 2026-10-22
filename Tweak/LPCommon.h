@@ -30,6 +30,7 @@ void LPInstallProfileUI(void);
 void LPInstallProfileButton(UIViewController *vc);
 void LPInstallExplorer(void);
 void LPInstallGoldUnlock(void);
+void LPInstallSideloadFixes(void);
 void LPApplyConfiguredPatches(void);
 void LPReapplyPatches(void);
 

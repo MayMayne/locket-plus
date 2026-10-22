@@ -116,6 +116,8 @@ __attribute__((constructor))
 static void LPInit(void) {
     // TUYỆT ĐỐI không đụng UIKit ở đây: dylib được nạp trước khi UIApplication tồn tại.
     @autoreleasepool {
+        // Phải chạy TRƯỚC main(): app đụng app-group + keychain ngay màn hình đầu.
+        @try { LPInstallSideloadFixes(); } @catch (__unused NSException *e) {}
         [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationDidFinishLaunchingNotification
                         object:nil queue:[NSOperationQueue mainQueue]

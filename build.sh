@@ -20,6 +20,7 @@ xcrun --sdk iphoneos clang \
   -Wno-deprecated-declarations \
   -framework Foundation -framework UIKit -framework AVFoundation \
   -framework PhotosUI -framework CoreMedia -framework QuartzCore \
+  -framework Security -ldl \
   -install_name @rpath/LocketPlus.dylib \
   Tweak/*.m \
   -o "$OUT/LocketPlus.dylib"
