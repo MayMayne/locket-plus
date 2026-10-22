@@ -170,10 +170,14 @@ static void LPRebindImage(const struct mach_header_64 *mh, intptr_t slide,
 // Chỉ vá ảnh nằm TRONG bundle app (main executable + Frameworks/).
 // Ảnh trong dyld shared cache (/usr/lib, /System) có __DATA_CONST read-only
 // sau fixup → ghi vào là crash.
+// Bỏ qua chính dylib này: nếu vá __got của mình thì LPAdd gọi gOrigAdd qua
+// đúng ô vừa bị ghi đè → không sai, nhưng rối và không cần thiết.
 static BOOL LPImageIsOurs(const struct mach_header *mh) {
     Dl_info info;
     if (dladdr((const void *)mh, &info) == 0 || !info.dli_fname) return NO;
-    return strstr(info.dli_fname, ".app/") != NULL;
+    if (strstr(info.dli_fname, ".app/") == NULL) return NO;
+    if (strstr(info.dli_fname, "LocketPlus.dylib") != NULL) return NO;
+    return YES;
 }
 
 static void LPRebindAllImages(LPRebind *items, int count) {
