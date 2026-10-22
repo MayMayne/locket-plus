@@ -48,6 +48,20 @@ static void LPInstallProfileHook(void) {
 
 #pragma mark - boot
 
+// Ghi bước đang chạy ra file NGAY LẬP TỨC (không buffer), để nếu app chết
+// giữa chừng thì lần mở sau vẫn đọc được bước cuối cùng.
+static void LPStep(const char *name) {
+    NSString *p = [LPConfig path:@"boot.trace"];
+    NSString *line = [NSString stringWithFormat:@"%s\n", name];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+    if (!fh) {
+        [line writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        return;
+    }
+    @try { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    @catch (__unused NSException *e) {}
+}
+
 static void LPBoot(void) {
     if (gBooted) return;
     gBooted = YES;
@@ -60,9 +74,13 @@ static void LPBoot(void) {
         return;
     }
 
+    LPStep("media");
     @try { LPInstallMediaHooks(); }   @catch (NSException *e) { LPLog(@"[boot] media: %@", e); }
+    LPStep("export");
     @try { LPInstallExportHooks(); }  @catch (NSException *e) { LPLog(@"[boot] export: %@", e); }
+    LPStep("gold");
     @try { LPInstallGoldUnlock(); }   @catch (NSException *e) { LPLog(@"[boot] gold: %@", e); }
+    LPStep("friend");
     @try { LPInstallFriendTools(); }  @catch (NSException *e) { LPLog(@"[boot] friend: %@", e); }
     // Tự chạy chẩn đoán 1 lần sau khi app ổn định, ghi ra friend.log (không UI).
     if ([[LPConfig shared] flag:@"friendProbeEnabled" fallback:YES]) {
@@ -71,11 +89,18 @@ static void LPBoot(void) {
             @try { LPRunFriendProbe(nil); } @catch (__unused NSException *e) {}
         });
     }
+    LPStep("patch");
     @try { LPApplyConfiguredPatches(); } @catch (NSException *e) { LPLog(@"[boot] patch: %@", e); }
+    LPStep("notes");
     @try { LPInstallNotesAccessory(); } @catch (NSException *e) { LPLog(@"[boot] notes: %@", e); }
+    LPStep("profile");
     @try { LPInstallProfileHook(); }  @catch (NSException *e) { LPLog(@"[boot] profile: %@", e); }
 
-    LPLog(@"[boot] Locket+ v1.9 sẵn sàng (không menu)");
+    LPStep("done");
+    // 8 giây sau mà app còn sống → boot thành công, lần sau không bật safeMode.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ LPMarkBootOK(); });
+    LPLog(@"[boot] Locket+ v1.11 sẵn sàng (không menu)");
 }
 
 __attribute__((constructor))
@@ -85,16 +110,6 @@ static void LPInit(void) {
         // Phải chạy TRƯỚC main(): app đụng app-group + keychain ngay màn hình đầu.
         @try { LPInstallSideloadFixes(); } @catch (__unused NSException *e) {}
 
-        // Thoát sạch → xoá cờ để lần sau không bật safeMode.
-        [[NSNotificationCenter defaultCenter]
-            addObserverForName:UIApplicationWillTerminateNotification
-                        object:nil queue:[NSOperationQueue mainQueue]
-                   usingBlock:^(NSNotification *n) {
-            NSString *dir = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
-            [[NSFileManager defaultManager] removeItemAtPath:
-                [[dir stringByAppendingPathComponent:@"LocketPlus"] stringByAppendingPathComponent:@"running.flag"]
-                                                       error:nil];
-        }];
         [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationDidFinishLaunchingNotification
                         object:nil queue:[NSOperationQueue mainQueue]

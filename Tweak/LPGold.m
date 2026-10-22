@@ -124,8 +124,23 @@ static NSNumber *LPRCNumber(id self, SEL _cmd) {
 static long long (*gOrigRCInt)(id, SEL);
 static long long LPRCInt(id self, SEL _cmd) {
     long long real = gOrigRCInt ? gOrigRCInt(self, _cmd) : 0;
-    NSNumber *n = LPRCNumber(self, _cmd);
-    return n ? (long long)n.longLongValue : real;
+    @try {
+        NSString *k = LPRCKeyString(self);
+        if (!k.length) return real;
+        NSString *lk = k.lowercaseString;
+        // Chỉ đụng key giới hạn video; trả nguyên các số khác của app.
+        if ([lk containsString:@"video"] && ([lk containsString:@"duration"] ||
+                                             [lk containsString:@"second"] ||
+                                             [lk containsString:@"length"])) {
+            return (long long)LPVideoSeconds();
+        }
+        if ([lk containsString:@"video"] && ([lk containsString:@"size"] ||
+                                             [lk containsString:@"bytes"] ||
+                                             [lk containsString:@"mb"])) {
+            return (long long)LPVideoBytes();
+        }
+    } @catch (__unused NSException *e) {}
+    return real;
 }
 
 static NSString *(*gOrigRCString)(id, SEL);
@@ -148,20 +163,40 @@ static NSString *LPRCString(id self, SEL _cmd) {
 
 #pragma mark - hook RevenueCat CustomerInfo
 
-// RCCustomerInfo.entitlements → NSDictionary<NSString*, RCEntitlementInfo*>
-static id (*gOrigCIEntitlements)(id, SEL);
-static id LPCIEntitlements(id self, SEL _cmd) {
-    id real = gOrigCIEntitlements ? gOrigCIEntitlements(self, _cmd) : nil;
-    NSMutableDictionary *d = [real isKindOfClass:[NSDictionary class]] ? [real mutableCopy]
-                                                                      : [NSMutableDictionary dictionary];
-    // Không tự chế object RCEntitlementInfo (sai class sẽ crash khi app đọc
-    // property). Chỉ đảm bảo key "Gold" tồn tại nếu app đã có object thật.
-    if (!d[kLPEntitlementID] && d.count) {
+// KHÔNG hook -[RCCustomerInfo entitlements]: nó trả RCEntitlementInfos
+// (một CLASS), không phải NSDictionary. Trả NSDictionary vào đây thì app gọi
+// .active/.all lên NSDictionary → unrecognized selector → CRASH ngay khi mở app.
+// Đây chính là lỗi làm bản v1.4–v1.10 crash.
+//
+// Thay vào đó hook đúng 2 property trả NSDictionary của RCEntitlementInfos.
+
+static NSDictionary *(*gOrigEntAll)(id, SEL);
+static NSDictionary *LPEntAll(id self, SEL _cmd) {
+    NSDictionary *real = gOrigEntAll ? gOrigEntAll(self, _cmd) : nil;
+    if (![real isKindOfClass:[NSDictionary class]] || !real.count) return real;
+    NSMutableDictionary *d = [real mutableCopy];
+    if (!d[kLPEntitlementID]) {
         for (NSString *k in d.allKeys) {
-            id v = d[k];
-            if ([k.lowercaseString containsString:@"gold"] ||
-                [k.lowercaseString containsString:@"premium"]) {
-                d[kLPEntitlementID] = v;
+            NSString *lk = k.lowercaseString;
+            if ([lk containsString:@"gold"] || [lk containsString:@"premium"]) {
+                d[kLPEntitlementID] = d[k];
+                break;
+            }
+        }
+    }
+    return d;
+}
+
+static NSDictionary *(*gOrigEntActive)(id, SEL);
+static NSDictionary *LPEntActive(id self, SEL _cmd) {
+    NSDictionary *real = gOrigEntActive ? gOrigEntActive(self, _cmd) : nil;
+    if (![real isKindOfClass:[NSDictionary class]] || !real.count) return real;
+    NSMutableDictionary *d = [real mutableCopy];
+    if (!d[kLPEntitlementID]) {
+        for (NSString *k in d.allKeys) {
+            NSString *lk = k.lowercaseString;
+            if ([lk containsString:@"gold"] || [lk containsString:@"premium"]) {
+                d[kLPEntitlementID] = d[k];
                 break;
             }
         }
@@ -241,11 +276,22 @@ static void LPInstallGoldHooks(void) {
 
         Class ci = NSClassFromString(@"RCCustomerInfo");
         if (ci) {
-            LPHookMethod(ci, @selector(entitlements), (IMP)LPCIEntitlements, (IMP *)&gOrigCIEntitlements);
-            LPHookMethod(ci, @selector(activeSubscriptions), (IMP)LPCIActiveSubscriptions, (IMP *)&gOrigCIActive);
-            LPLog(@"[gold] hook RCCustomerInfo");
+            // Chỉ hook activeSubscriptions (trả NSSet — đúng kiểu).
+            if (LPHookMethodTyped(ci, @selector(activeSubscriptions), "@",
+                                  (IMP)LPCIActiveSubscriptions, (IMP *)&gOrigCIActive)) {
+                LPLog(@"[gold] hook RCCustomerInfo.activeSubscriptions");
+            }
         } else {
             LPLog(@"[gold] KHÔNG có RCCustomerInfo");
+        }
+
+        // RCEntitlementInfos: .all và .active đều trả NSDictionary → an toàn.
+        Class ent = NSClassFromString(@"RCEntitlementInfos");
+        if (ent) {
+            // '@' = trả object. Nếu RevenueCat đổi sang trả kiểu khác thì bỏ qua.
+            LPHookMethodTyped(ent, @selector(all), "@", (IMP)LPEntAll, (IMP *)&gOrigEntAll);
+            LPHookMethodTyped(ent, @selector(active), "@", (IMP)LPEntActive, (IMP *)&gOrigEntActive);
+            LPLog(@"[gold] hook RCEntitlementInfos.all/.active");
         }
 
         // Quét class Swift của app: chỉ những class tên có nghĩa subscription.

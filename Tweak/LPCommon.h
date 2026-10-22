@@ -24,6 +24,8 @@ double LPVideoSeconds(void);
 double LPVideoBytes(void);
 
 void LPInstallCrashHandler(void);
+void LPMarkBootOK(void);
+void LPWriteCrashText(NSString *text);
 void LPInstallMediaHooks(void);
 void LPInstallFriendTools(void);
 void LPInstallProfileUI(void);
@@ -61,6 +63,8 @@ IMP LPOrigIMPFor(id self, SEL sel);
 
 // Móc an toàn: nếu class/method chưa tồn tại thì KHÔNG làm gì (không crash).
 BOOL LPHookMethod(Class cls, SEL sel, IMP newImp, IMP *origOut);
+// Như trên nhưng chỉ hook khi kiểu trả khớp (an toàn hơn).
+BOOL LPHookMethodTyped(Class cls, SEL sel, const char *expectReturn, IMP newImp, IMP *origOut);
 // Tìm class đầu tiên trong danh sách có method (dùng cho class Swift đổi tên giữa các bản).
 Class LPFindClassWithMethod(NSArray<NSString *> *names, SEL sel);
 

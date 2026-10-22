@@ -97,6 +97,24 @@ IMP LPOrigIMPFor(id self, SEL sel) {
 
 #pragma mark - hook an toàn
 
+// Hook chỉ khi type encoding của method khớp với kỳ vọng.
+// Trả sai kiểu (ví dụ trả NSDictionary cho method thật trả object khác) là
+// nguyên nhân crash "unrecognized selector" — đây là lỗi khó thấy nhất.
+BOOL LPHookMethodTyped(Class cls, SEL sel, const char *expectReturn,
+                       IMP newImp, IMP *origOut) {
+    if (!cls || !sel || !newImp) return NO;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+    const char *enc = method_getTypeEncoding(m);
+    if (!enc || !enc[0]) return NO;
+    if (expectReturn && expectReturn[0] && enc[0] != expectReturn[0]) {
+        LPLog(@"[hook] BỎ %@.%@ — kiểu trả '%c', cần '%c'",
+              NSStringFromClass(cls), NSStringFromSelector(sel), enc[0], expectReturn[0]);
+        return NO;
+    }
+    return LPHookMethod(cls, sel, newImp, origOut);
+}
+
 BOOL LPHookMethod(Class cls, SEL sel, IMP newImp, IMP *origOut) {
     if (!cls || !sel || !newImp) return NO;
     Method m = class_getInstanceMethod(cls, sel);
