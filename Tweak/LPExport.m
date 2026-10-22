@@ -92,7 +92,7 @@ NSURL *LPExportVideoWithRatio(NSURL *srcURL, NSString *ratio, NSError **outErr) 
     vc.renderSize = CGSizeMake(outW, outH);
     vc.frameDuration = CMTimeMake(1, 30);
 
-    AVMutableVideoCompositionInstruction *ins = [AVMutableVideoCompositionInstruction videoInstruction];
+    AVMutableVideoCompositionInstruction *ins = [[AVMutableVideoCompositionInstruction alloc] init];
     ins.timeRange = CMTimeRangeMake(kCMTimeZero, asset.duration);
 
     AVMutableVideoCompositionLayerInstruction *layer =
@@ -146,7 +146,7 @@ NSURL *LPExportVideoWithRatio(NSURL *srcURL, NSString *ratio, NSError **outErr) 
     if (!ex) return nil;
 
     ex.outputURL = outURL;
-    ex.outputFileType = AVFileTypeMP4;
+    ex.outputFileType = AVFileTypeMPEG4;
     ex.shouldOptimizeForNetworkUse = YES;
     if (target > 0) ex.videoComposition = vc;
 
