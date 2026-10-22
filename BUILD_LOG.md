@@ -1,17 +1,17 @@
 # build
 
 ```
-Tweak/LPFriend.m:76:29: warning: performSelector may cause a leak because its selector is unknown [-Warc-performSelector-leaks]
-   76 |     return FIRApp ? [FIRApp performSelector:NSSelectorFromString(@"defaultApp")] : nil;
-      |                             ^
-Tweak/LPFriend.m:76:45: note: used here
-   76 |     return FIRApp ? [FIRApp performSelector:NSSelectorFromString(@"defaultApp")] : nil;
-      |                                             ^
+Tweak/LPCommon.m:285:51: warning: capturing 'retry' strongly in this block is likely to lead to a retain cycle [-Warc-retain-cycles]
+  285 |                        dispatch_get_main_queue(), retry);
+      |                                                   ^~~~~
+Tweak/LPCommon.m:277:5: note: block will be retained by the captured object
+  277 |     retry = ^{
+      |     ^~~~~
 1 warning generated.
 ==> build/LocketPlus.dylib
 Non-fat file: build/LocketPlus.dylib is architecture: arm64
 Executable=/Users/runner/work/locket-plus/locket-plus/build/LocketPlus.dylib
-Identifier=LocketPlus-55554944a2f8aa81ed113723aa0cba7370ddfe39
+Identifier=LocketPlus-55554944e9f366b84a983c108f299260fc78051a
 Format=Mach-O thin (arm64)
 exit=0
 
