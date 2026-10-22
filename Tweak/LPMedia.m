@@ -428,6 +428,16 @@ static void LPApplyComposition(id session, NSString *ratioChoice) {
         AVAsset *asset = ((id (*)(id, SEL))objc_msgSend)(session, @selector(asset));
         if (![asset isKindOfClass:[AVAsset class]]) return;
 
+        // Passthrough KHÔNG hỗ trợ videoComposition — gắn vào là export fail
+        // với lỗi khó hiểu. Bỏ qua, giữ nguyên hành vi gốc.
+        if ([session respondsToSelector:@selector(presetName)]) {
+            NSString *preset = ((id (*)(id, SEL))objc_msgSend)(session, @selector(presetName));
+            if ([preset isEqualToString:AVAssetExportPresetPassthrough]) {
+                LPLog(@"[media] preset passthrough → không gắn composition");
+                return;
+            }
+        }
+
         AVMutableVideoComposition *vc = LPFitComposition(asset, ratio);
         if (!vc) { LPLog(@"[media] không dựng được composition"); return; }
 

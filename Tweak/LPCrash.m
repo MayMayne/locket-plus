@@ -66,27 +66,6 @@ static void LPSignalHandler(int sig, siginfo_t *info, void *ctx) {
 
     if (gCrashFd >= 0) { fsync(gCrashFd); close(gCrashFd); gCrashFd = -1; }
 
-    // Ghi số lần chết trước khi thoát — dùng path tuyệt đối, không Foundation.
-    char path[512];
-    const char *docs = getenv("HOME");
-    if (docs) {
-        snprintf(path, sizeof(path), "%s/Documents/LocketPlus/crash.count", docs);
-        int fd = open(path, O_RDWR | O_CREAT, 0644);
-        if (fd >= 0) {
-            char c[16] = {0};
-            ssize_t r = read(fd, c, sizeof(c) - 1);
-            int v = (r > 0) ? atoi(c) : 0;
-            v++;
-            lseek(fd, 0, SEEK_SET);
-            ftruncate(fd, 0);
-            char out[16];
-            int len = snprintf(out, sizeof(out), "%d", v);
-            ssize_t w = write(fd, out, (size_t)len);
-            (void)w;
-            close(fd);
-        }
-    }
-
     signal(sig, SIG_DFL);
     raise(sig);
 }
@@ -146,21 +125,48 @@ void LPInstallCrashHandler(void) {
 
 #pragma mark - boot counter
 
-// Đếm số lần chết LIÊN TIẾP.
-//   LPBootBegin   : đọc count cũ; >= 2 → safeMode; rồi ghi count+1
-//   LPMarkBootOK  : ghi 0 (boot xong mới reset)
-// Nhờ vậy: boot1 ghi 1 → chết; boot2 đọc 1, ghi 2 → chết; boot3 đọc 2 → safeMode.
-// (Bản trước reset ngay trong LPBootBegin nên count không bao giờ lên tới 2.)
+// Đếm số lần CHẾT LIÊN TIẾP — dựa trên kích thước crash.txt, không dựa vào
+// số lần mở app.
+//
+// Vì sao không đếm theo số lần boot: user vuốt tắt app là chuyện thường, đếm
+// kiểu đó sẽ bật safeMode sai sau 2 lần thoát bình thường.
+//
+// Cách đúng: crash handler APPEND vào crash.txt rồi fsync. Nếu lần boot này
+// thấy crash.txt LỚN HƠN kích thước đã lưu ở lần boot trước → lần trước đã chết.
 void LPBootBegin(void) {
-    NSString *p = LPPath(@"crash.count");
-    int v = [[NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:nil] intValue];
-    if (v >= 2) {
-        LPSetSafeMode(YES);
-        LPLog(@"[boot] chết %d lần liên tiếp → safeMode", v);
-        v = 0;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *crashPath = LPPath(@"crash.txt");
+    NSString *sizePath  = LPPath(@"crash.size");
+    NSString *countPath = LPPath(@"crash.count");
+
+    unsigned long long now = 0;
+    NSDictionary *attrs = [fm attributesOfItemAtPath:crashPath error:nil];
+    if (attrs) now = [attrs[NSFileSize] unsignedLongLongValue];
+
+    unsigned long long prev = 0;
+    NSString *s = [NSString stringWithContentsOfFile:sizePath
+                                            encoding:NSUTF8StringEncoding error:nil];
+    if (s.length) prev = strtoull(s.UTF8String, NULL, 10);
+
+    int n = [[NSString stringWithContentsOfFile:countPath
+                                       encoding:NSUTF8StringEncoding error:nil] intValue];
+
+    if (now > prev) {
+        n++;                                  // lần trước đã chết
+    } else {
+        n = 0;                                // thoát sạch
     }
-    [[NSString stringWithFormat:@"%d", v + 1]
-        writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    if (n >= 2) {
+        LPSetSafeMode(YES);
+        LPLog(@"[boot] chết %d lần liên tiếp → safeMode", n);
+        n = 0;
+    }
+
+    [[NSString stringWithFormat:@"%d", n]
+        writeToFile:countPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    [[NSString stringWithFormat:@"%llu", now]
+        writeToFile:sizePath atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 void LPMarkBootOK(void) {
