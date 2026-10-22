@@ -285,21 +285,25 @@ static OSStatus LPDel(CFDictionaryRef q) {
 #pragma mark - app group container
 
 // Base của app group: <container>/Library/Shared/AppGroup
-// blatantsPatch dựng đúng đường dẫn này (_ContainerURL @0x474c:
-// NSSearchPathForDirectoriesInDomains(9=Library, 1=User, 1=YES) → "Shared/AppGroup").
-// Cache lại: hàm này bị gọi trong hook, KHÔNG được làm I/O mỗi lần.
+// blatantsPatch dựng đúng đường dẫn này (_ContainerURL @0x474c).
+//
+// CHỈ POSIX: hàm này chạy TỪ TRONG hook NSUserDefaults, mà hook đó có thể chạy
+// giữa lúc NSUserDefaults đang khởi tạo. Gọi Foundation ở đây có thể quay lại
+// NSUserDefaults → đệ quy → treo (đúng lỗi làm app đứng im ở v5.0–v5.5).
+// Cache lại: không được làm I/O mỗi lần gọi.
 static NSString *LPSharedGroupBase(void) {
-    static NSString *base;
+    static char base[512];
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSString *lib = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory,
-                                                            NSUserDomainMask, YES).firstObject;
-        if (!lib.length) lib = NSTemporaryDirectory();
-        base = [lib stringByAppendingPathComponent:@"Shared/AppGroup"];
-        [[NSFileManager defaultManager] createDirectoryAtPath:base
-                                  withIntermediateDirectories:YES attributes:nil error:nil];
+        const char *home = getenv("HOME");
+        if (home && *home) {
+            snprintf(base, sizeof(base), "%s/Library/Shared/AppGroup", home);
+        } else {
+            snprintf(base, sizeof(base), "%s", NSTemporaryDirectory().UTF8String ?: "/tmp");
+        }
+        mkdir(base, 0755);
     });
-    return base;
+    return [NSString stringWithUTF8String:base];
 }
 
 static NSURL *(*gOrigContainer)(id, SEL, NSString *);

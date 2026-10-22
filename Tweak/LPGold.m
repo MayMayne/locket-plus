@@ -41,14 +41,16 @@ static NSArray<NSString *> *LPGoldProductIDs(void) {
 
 #pragma mark - thời gian ISO8601
 
+// Dùng NSISO8601DateFormatter thay NSDateFormatter: nó KHÔNG đọc locale từ
+// NSUserDefaults (NSDateFormatter không set locale sẽ đọc), nên gọi được từ
+// trong hook mạng mà không có nguy cơ đệ quy vào NSUserDefaults.
 static NSString *LPIso(NSDate *d) {
-    static NSDateFormatter *df;
+    static NSISO8601DateFormatter *df;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        df = [NSDateFormatter new];
-        df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        df = [NSISO8601DateFormatter new];
+        df.formatOptions = NSISO8601DateFormatWithInternetDateTime;
         df.timeZone = [NSTimeZone timeZoneWithAbbreviation:@"UTC"];
-        df.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss'Z'";
     });
     return [df stringFromDate:d ?: [NSDate date]];
 }
