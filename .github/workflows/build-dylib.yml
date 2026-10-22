@@ -63,6 +63,11 @@ jobs:
           print(urllib.request.urlopen(req, timeout=60).status)
           PY
 
+      - name: Fail on compile error
+        run: |
+          grep -E "error:" /tmp/lp_build.log && exit 1 || true
+          test -f build/LocketPlus.dylib
+
       - name: Verify and sign
         run: |
           file build/LocketPlus.dylib && ls -l build/LocketPlus.dylib

@@ -2,8 +2,29 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
+//
+// LPFriend — chẩn đoán kết bạn.
+//
+// Sự thật (đã kiểm chứng trên binary 2.68 + Cloud Functions của project locket-4252a):
+//   sendFriendRequest / acceptFriendRequest chạy trên Firebase Functions và server
+//   kiểm tra X-Firebase-AppCheck. Bản IPA ký lại bằng chứng chỉ khác không tạo được
+//   attestation hợp lệ cho team SWD4AZY4KG → server từ chối. Không client nào phá được.
+//
+// Việc CÓ THỂ làm ở client, và tweak này làm:
+//   1. Bắt mọi request kết bạn + in nguyên HTTP status / body / mã lỗi để biết chính xác
+//      server chặn ở đâu (401 = auth, 403 = App Check / permission, 400 = payload).
+//   2. Nếu là 401 do token cũ (keychain bị đứt khi sideload) → ép refresh ID token
+//      rồi replay 1 lần. Trường hợp này THẬT SỰ cứu được.
+//   3. Nếu là 403 App Check → log rõ "không cứu được trên bản sideload".
+//
+// ĐÃ BỎ so với bản trước: hook -[GTMSessionFetcher startWithCompletionHandler:]
+//   rồi KVC "request"/"response" — GTMSessionFetcher không có property đó,
+//   mỗi lần gọi là ném NSException → app chết ngay khi mở.
+//
+
 static NSMutableArray<NSDictionary *> *gFriendLog;
 static BOOL gFriendHooks = NO;
+static BOOL gAuthRecovered = NO;
 
 #pragma mark - nhận diện + log
 
@@ -86,17 +107,19 @@ static void LPFetchAppCheckToken(void (^done)(NSString *token, NSString *err)) {
 
 #pragma mark - replay
 
-static void LPReplay(NSURLRequest *original, NSInteger attempt, NSString *idToken, NSString *acToken) {
+static void LPReplay(NSURLRequest *original, NSString *idToken, NSString *acToken) {
     NSMutableURLRequest *req = [original mutableCopy];
     if (idToken) [req setValue:[@"Bearer " stringByAppendingString:idToken] forHTTPHeaderField:@"Authorization"];
     if (acToken) [req setValue:acToken forHTTPHeaderField:@"X-Firebase-AppCheck"];
-    LPAddFriendLog([NSString stringWithFormat:@"[replay %ld] %@ %@", (long)attempt, req.HTTPMethod, req.URL.path]);
-    [[[NSURLSession sharedSession] dataTaskWithRequest:req
-        completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-            LPAddFriendLog([NSString stringWithFormat:@"[replay] -> HTTP %ld body=%@ err=%@",
-                            (long)[(NSHTTPURLResponse *)resp statusCode], LPTrunc(data, 700),
-                            err.localizedDescription ?: @"-"]);
-        }] resume];
+    LPAddFriendLog([NSString stringWithFormat:@"[replay] %@ %@", req.HTTPMethod, req.URL.path]);
+    // Dùng session riêng để replay KHÔNG bị hook của chính mình bắt lại (vòng lặp vô hạn).
+    NSURLSession *s = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.ephemeralSessionConfiguration];
+    [[s dataTaskWithRequest:req completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        LPAddFriendLog([NSString stringWithFormat:@"[replay] -> HTTP %ld body=%@ err=%@",
+                        (long)[(NSHTTPURLResponse *)resp statusCode], LPTrunc(data, 900),
+                        err.localizedDescription ?: @"-"]);
+        [s finishTasksAndInvalidate];
+    }] resume];
 }
 
 #pragma mark - xử lý phản hồi
@@ -106,28 +129,32 @@ static void LPHandleFriendResponse(NSURLRequest *req, NSData *data, NSURLRespons
     NSMutableString *line = [NSMutableString stringWithFormat:@"%@ %@ -> HTTP %ld",
                              req.HTTPMethod, req.URL.path, (long)code];
     if (err) [line appendFormat:@" (err %@ %ld)", err.domain, (long)err.code];
-    if (req.HTTPBody) [line appendFormat:@"\n   req: %@", LPTrunc(req.HTTPBody, 900)];
+    if (req.HTTPBody) [line appendFormat:@"\n   req: %@", LPTrunc(req.HTTPBody, 600)];
     if (data.length) [line appendFormat:@"\n   res: %@", LPTrunc(data, 900)];
     LPAddFriendLog(line);
 
-    if (!(code == 401 || code == 403)) return;
-    if (![[LPConfig shared] flag:@"autoRefreshOnAuthFail" fallback:YES]) return;
-
-    LPAddFriendLog(@"bị 401/403 → làm mới ID token + App Check token và replay 1 lần");
-    LPFetchIDToken(^(NSString *idToken, NSString *idErr) {
-        LPAddFriendLog([NSString stringWithFormat:@"ID token: %@",
-                        idToken ? [NSString stringWithFormat:@"ok (%lu ký tự)", (unsigned long)idToken.length]
-                                : [@"FAIL " stringByAppendingString:idErr ?: @""]]);
-        LPFetchAppCheckToken(^(NSString *acToken, NSString *acErr) {
-            LPAddFriendLog([NSString stringWithFormat:@"AppCheck token: %@",
-                            acToken ? [NSString stringWithFormat:@"ok (%lu ký tự)", (unsigned long)acToken.length]
-                                    : [@"FAIL " stringByAppendingString:acErr ?: @""]]);
-            LPReplay(req, 1, idToken, acToken);
+    // 401 = token đăng nhập cũ/hỏng → refresh + replay có thể cứu.
+    // 403 = App Check / permission → bản sideload không cứu được, chỉ log.
+    if (code == 401 && !gAuthRecovered &&
+        [[LPConfig shared] flag:@"autoRefreshOnAuthFail" fallback:YES]) {
+        gAuthRecovered = YES;
+        LPAddFriendLog(@"401 → ép làm mới ID token rồi replay 1 lần");
+        LPFetchIDToken(^(NSString *idToken, NSString *idErr) {
+            LPAddFriendLog(idToken ? [NSString stringWithFormat:@"ID token: ok (%lu ký tự)", (unsigned long)idToken.length]
+                                   : [@"ID token: FAIL " stringByAppendingString:idErr ?: @""]);
+            if (!idToken) return;
+            LPFetchAppCheckToken(^(NSString *acToken, NSString *acErr) {
+                LPAddFriendLog(acToken ? [NSString stringWithFormat:@"AppCheck: ok (%lu ký tự)", (unsigned long)acToken.length]
+                                       : [@"AppCheck: FAIL " stringByAppendingString:acErr ?: @""]);
+                LPReplay(req, idToken, acToken);
+            });
         });
-    });
+    } else if (code == 403) {
+        LPAddFriendLog(@"403 → App Check/attestation của team gốc. Bản sideload không tạo được attestation hợp lệ.");
+    }
 }
 
-#pragma mark - hook NSURLSession
+#pragma mark - hook NSURLSession (chỉ request kết bạn)
 
 static id LPDataTaskHook(id self, SEL _cmd, NSURLRequest *req, id completion) {
     IMP o = LPOrigIMPFor(self, _cmd);
@@ -135,7 +162,7 @@ static id LPDataTaskHook(id self, SEL _cmd, NSURLRequest *req, id completion) {
     if (!LPFriendURL(req.URL)) return ((id (*)(id, SEL, NSURLRequest *, id))o)(self, _cmd, req, completion);
     void (^orig)(NSData *, NSURLResponse *, NSError *) = completion;
     id wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
-        LPHandleFriendResponse(req, data, resp, err);
+        @try { LPHandleFriendResponse(req, data, resp, err); } @catch (__unused NSException *e) {}
         if (orig) orig(data, resp, err);
     };
     return ((id (*)(id, SEL, NSURLRequest *, id))o)(self, _cmd, req, wrapped);
@@ -147,27 +174,10 @@ static id LPUploadTaskHook(id self, SEL _cmd, NSURLRequest *req, NSData *body, i
     if (!LPFriendURL(req.URL)) return ((id (*)(id, SEL, NSURLRequest *, NSData *, id))o)(self, _cmd, req, body, completion);
     void (^orig)(NSData *, NSURLResponse *, NSError *) = completion;
     id wrapped = ^(NSData *data, NSURLResponse *resp, NSError *err) {
-        LPHandleFriendResponse(req, data, resp, err);
+        @try { LPHandleFriendResponse(req, data, resp, err); } @catch (__unused NSException *e) {}
         if (orig) orig(data, resp, err);
     };
     return ((id (*)(id, SEL, NSURLRequest *, NSData *, id))o)(self, _cmd, req, body, wrapped);
-}
-
-// GTMSessionFetcher — Firebase Functions trên iOS dùng thư viện này
-static void LPFetcherStartHook(id self, SEL _cmd, id completion) {
-    IMP o = LPOrigIMPFor(self, _cmd);
-    if (!o) return;
-    NSURLRequest *req = nil;
-    @try { req = [self valueForKey:@"request"]; } @catch (__unused NSException *e) {}
-    if (!req || !LPFriendURL(req.URL)) { ((void (*)(id, SEL, id))o)(self, _cmd, completion); return; }
-    void (^orig)(NSData *, NSError *) = completion;
-    id wrapped = ^(NSData *data, NSError *err) {
-        NSURLResponse *resp = nil;
-        @try { resp = [self valueForKey:@"response"]; } @catch (__unused NSException *e) {}
-        LPHandleFriendResponse(req, data, resp, err);
-        if (orig) orig(data, err);
-    };
-    ((void (*)(id, SEL, id))o)(self, _cmd, wrapped);
 }
 
 #pragma mark - probe
@@ -183,6 +193,7 @@ void LPRunFriendProbe(UIViewController *host) {
         [out appendFormat:@"ID token: %@\n", idToken ? [NSString stringWithFormat:@"ok %lu ký tự", (unsigned long)idToken.length] : idErr];
         LPFetchAppCheckToken(^(NSString *acToken, NSString *acErr) {
             [out appendFormat:@"AppCheck: %@\n", acToken ? [NSString stringWithFormat:@"ok %lu ký tự", (unsigned long)acToken.length] : acErr];
+            [out appendString:@"\n401 → refresh cứu được. 403 → App Check, không cứu được.\n"];
             LPShowText(host, @"Chẩn đoán kết bạn", out);
         });
     });
@@ -194,18 +205,12 @@ void LPInstallFriendTools(void) {
     if (gFriendHooks) return;
     gFriendHooks = YES;
 
-    // KHÔNG hook NSURLSession: Locket và Firebase gọi nó liên tục, hook sai
-    // chữ ký block làm app chết. Chỉ hook GTMSessionFetcher — đúng lớp mà
-    // Firebase Functions dùng cho sendFriendRequest/acceptFriendRequest.
-    Class fetcher = NSClassFromString(@"GTMSessionFetcher");
-    if (fetcher) {
-        SEL s3 = NSSelectorFromString(@"startWithCompletionHandler:");
-        Method m3 = class_getInstanceMethod(fetcher, s3);
-        if (m3) {
-            LPSetOrigIMP(fetcher, s3, method_getImplementation(m3));
-            method_setImplementation(m3, (IMP)LPFetcherStartHook);
-            LPLog(@"[friend] hook GTMSessionFetcher");
-        }
-    }
+    // NSURLSession là class cluster: method nằm trên NSURLSession nên hook ở đây
+    // áp dụng cho mọi session (kể cả session của Firebase). Chỉ request khớp
+    // LPFriendURL mới bị bọc, còn lại đi thẳng.
+    Class s = NSClassFromString(@"NSURLSession");
+    BOOL a = LPHookMethod(s, @selector(dataTaskWithRequest:completionHandler:), (IMP)LPDataTaskHook, NULL);
+    BOOL b = LPHookMethod(s, @selector(uploadTaskWithRequest:fromData:completionHandler:), (IMP)LPUploadTaskHook, NULL);
+    LPLog(@"[friend] hook NSURLSession data=%d upload=%d", a, b);
     LPAddFriendLog(@"bộ chẩn đoán kết bạn đã bật");
 }

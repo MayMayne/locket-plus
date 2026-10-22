@@ -1,50 +1,59 @@
 #import "LPCommon.h"
 #import <AVFoundation/AVFoundation.h>
+#import <PhotosUI/PhotosUI.h>
 #import <objc/runtime.h>
 
-static BOOL gVideoHooksInstalled = NO;
+//
+// LPMedia — phá trần quay/chọn video.
+//
+// ĐÃ BỎ so với bản trước (đây là lỗi làm app chết):
+//   - hook -[AVAsset duration]  → chỉ cần đọc duration của video là nổ, và hook
+//     getter vốn KHÔNG chặn được giới hạn nào vì app đọc từ Swift property.
+//   - hook -[NSFileManager attributesOfItemAtPath:error:] → chạy hàng nghìn lần,
+//     và ghi đè NSFileSize làm Locket đọc file lỗi.
+//   - hook -[NSURLSession uploadTaskWithRequest:fromData:] → chữ ký block dễ sai,
+//     upload ảnh/video nào cũng đi qua đây.
+//
+// GIỚI HẠN THẬT CỦA LOCKET (đọc từ binary 2.68):
+//   * Quay: AVCaptureMovieFileOutput.maxRecordedDuration / maxRecordedFileSize  (client)
+//   * Chọn từ thư viện: PHPicker (KHÔNG dùng UIImagePickerController) → lọc bằng
+//     PHPickerFilter + kiểm tra duration/size sau khi load, không có setter để hook.
+//   * Upload: Storage rules + Cloud Function kiểm duration/size  (server, không phá được)
+//
 
-#pragma mark - helpers
+static BOOL gMediaHooksInstalled = NO;
 
-static void LPHook(Class cls, SEL sel, IMP newImp) {
-    if (!cls) { LPLog(@"[media] không có class cho %@", NSStringFromSelector(sel)); return; }
-    Method m = class_getInstanceMethod(cls, sel);
-    if (!m) { LPLog(@"[media] thiếu method %@.%@", NSStringFromClass(cls), NSStringFromSelector(sel)); return; }
-    IMP orig = method_getImplementation(m);
-    LPSetOrigIMP(cls, sel, orig);
-    method_setImplementation(m, newImp);
-    LPLog(@"[media] hook %@.%@", NSStringFromClass(cls), NSStringFromSelector(sel));
+static void LPMHook(Class cls, SEL sel, IMP newImp) {
+    if (LPHookMethod(cls, sel, newImp, NULL)) {
+        LPLog(@"[media] hook %@.%@", NSStringFromClass(cls), NSStringFromSelector(sel));
+    } else {
+        LPLog(@"[media] bỏ qua %@.%@ (không có)", cls ? NSStringFromClass(cls) : @"nil", NSStringFromSelector(sel));
+    }
 }
 
-#pragma mark - AVFoundation: thời lượng / dung lượng
+#pragma mark - AVCaptureMovieFileOutput: trần quay
 
-// AVCaptureMovieFileOutput: app đặt trần quay phim
 static void LPMovieMaxDurationSet(id self, SEL _cmd, CMTime t) {
     double secs = CMTimeGetSeconds(t);
     if (secs > 0 && !isnan(secs)) LPLog(@"[media] maxRecordedDuration thật = %.1fs -> ép %.0fs", secs, LPVideoSeconds());
-    CMTime forced = CMTimeMakeWithSeconds(LPVideoSeconds(), 600);
     IMP o = LPOrigIMPFor(self, _cmd);
-    if (o) ((void (*)(id, SEL, CMTime))o)(self, _cmd, forced);
+    if (o) ((void (*)(id, SEL, CMTime))o)(self, _cmd, CMTimeMakeWithSeconds(LPVideoSeconds(), 600));
 }
 
 static void LPMovieMaxSizeSet(id self, SEL _cmd, long long size) {
-    LPLog(@"[media] maxRecordedFileSize thật = %lld bytes -> ép %.0f", size, LPVideoBytes());
+    LPLog(@"[media] maxRecordedFileSize thật = %lld -> ép %.0f", size, LPVideoBytes());
     IMP o = LPOrigIMPFor(self, _cmd);
     if (o) ((void (*)(id, SEL, long long))o)(self, _cmd, (long long)LPVideoBytes());
 }
 
-// UIImagePickerController (chọn video từ thư viện)
-static void LPPickerMaxDurSet(id self, SEL _cmd, double secs) {
-    LPLog(@"[media] videoMaximumDuration thật = %.1fs -> ép %.0fs", secs, LPVideoSeconds());
-    IMP o = LPOrigIMPFor(self, _cmd);
-    if (o) ((void (*)(id, SEL, double))o)(self, _cmd, LPVideoSeconds());
-}
+#pragma mark - AVAssetExportSession: đừng để app tự cắt ngắn
 
-// AVAssetExportSession: mở lại timeRange nếu app cắt
+// Chỉ nới khi range bị cắt ngắn hơn asset — không bao giờ kéo dài quá độ dài thật.
 static void LPExportTimeRangeSet(id self, SEL _cmd, CMTimeRange r) {
     IMP o = LPOrigIMPFor(self, _cmd);
-    if (![[LPConfig shared] flag:@"widenExportRange" fallback:YES] || !o) {
-        if (o) ((void (*)(id, SEL, CMTimeRange))o)(self, _cmd, r);
+    if (!o) return;
+    if (![[LPConfig shared] flag:@"widenExportRange" fallback:YES]) {
+        ((void (*)(id, SEL, CMTimeRange))o)(self, _cmd, r);
         return;
     }
     AVAsset *asset = nil;
@@ -52,8 +61,8 @@ static void LPExportTimeRangeSet(id self, SEL _cmd, CMTimeRange r) {
     if (asset && CMTIME_IS_VALID(asset.duration)) {
         double full = CMTimeGetSeconds(asset.duration);
         double end = CMTimeGetSeconds(CMTimeRangeGetEnd(r));
-        if (full > 0 && end < full - 0.05) {
-            LPLog(@"[media] export range 0→%.2fs của asset %.2fs -> mở full", end, full);
+        if (full > 0 && end > 0 && end < full - 0.05) {
+            LPLog(@"[media] export 0→%.2fs của asset %.2fs -> mở hết", end, full);
             ((void (*)(id, SEL, CMTimeRange))o)(self, _cmd, CMTimeRangeMake(kCMTimeZero, asset.duration));
             return;
         }
@@ -61,78 +70,45 @@ static void LPExportTimeRangeSet(id self, SEL _cmd, CMTimeRange r) {
     ((void (*)(id, SEL, CMTimeRange))o)(self, _cmd, r);
 }
 
-// AVAsset.duration: báo ngắn hơn để UI/validator cho qua
-static CMTime LPDurationGet(id self, SEL _cmd) {
+static void LPExportFileLengthSet(id self, SEL _cmd, long long limit) {
     IMP o = LPOrigIMPFor(self, _cmd);
-    CMTime d = o ? ((CMTime (*)(id, SEL))o)(self, _cmd) : kCMTimeZero;
-    if (![[LPConfig shared] flag:@"clampReportedDuration" fallback:YES]) return d;
-    double secs = CMTimeGetSeconds(d);
-    if (secs > LPVideoSeconds()) {
-        LPLog(@"[media] %@.duration %.1fs -> báo %.1fs", NSStringFromClass([self class]), secs, LPVideoSeconds());
-        return CMTimeMakeWithSeconds(LPVideoSeconds(), 600);
-    }
-    return d;
+    if (o) ((void (*)(id, SEL, long long))o)(self, _cmd, (long long)LPVideoBytes());
 }
 
-// NSURL.duration trên file .mov/.mp4 cũng có thể bị kiểm
-static NSDictionary *LPFileAttributes(id self, SEL _cmd, NSString *path, NSError **err) {
+#pragma mark - UIImagePickerController (Locket 2.68 không dùng, để dành cho bản cũ)
+
+static void LPPickerMaxDurSet(id self, SEL _cmd, double secs) {
+    LPLog(@"[media] videoMaximumDuration thật = %.1fs -> ép %.0fs", secs, LPVideoSeconds());
     IMP o = LPOrigIMPFor(self, _cmd);
-    NSDictionary *d = o ? ((NSDictionary *(*)(id, SEL, NSString *, NSError **))o)(self, _cmd, path, err) : nil;
-    if (!d || ![[LPConfig shared] flag:@"clampReportedSize" fallback:YES]) return d;
-    NSNumber *sz = d[NSFileSize];
-    if (sz && sz.doubleValue > LPVideoBytes()) {
-        NSMutableDictionary *m = [d mutableCopy];
-        m[NSFileSize] = @((long long)LPVideoBytes());
-        LPLog(@"[media] %@ %.1fMB -> báo %.0fMB", path.lastPathComponent, sz.doubleValue / 1048576.0,
-              LPVideoBytes() / 1048576.0);
-        return m;
-    }
-    return d;
+    if (o) ((void (*)(id, SEL, double))o)(self, _cmd, LPVideoSeconds());
 }
 
-static BOOL LPGetResourceValue(id self, SEL _cmd, id *out, NSString *key, NSError **err) {
-    IMP o = LPOrigIMPFor(self, _cmd);
-    BOOL ok = o ? ((BOOL (*)(id, SEL, id *, NSString *, NSError **))o)(self, _cmd, out, key, err) : NO;
-    if (ok && out && [key isEqualToString:NSURLFileSizeKey] &&
-        [[LPConfig shared] flag:@"clampReportedSize" fallback:YES]) {
-        NSNumber *sz = (NSNumber *)*out;
-        if ([sz isKindOfClass:[NSNumber class]] && sz.doubleValue > LPVideoBytes()) {
-            LPLog(@"[media] NSURLFileSize %.1fMB -> báo %.0fMB", sz.doubleValue / 1048576.0,
-                  LPVideoBytes() / 1048576.0);
-            *out = @((long long)LPVideoBytes());
-        }
-    }
-    return ok;
-}
+#pragma mark - ghi nhận giới hạn thật để chẩn đoán
 
-#pragma mark - đo dung lượng upload
-
-static id LPUploadData(id self, SEL _cmd, NSURLRequest *req, NSData *body, id completion) {
-    LPLog(@"[net] upload %@ %ld bytes", req.URL.path, (long)body.length);
+static void LPMovieMaxDurationGet(id self, SEL _cmd, void *ret) {
     IMP o = LPOrigIMPFor(self, _cmd);
-    return o ? ((id (*)(id, SEL, NSURLRequest *, NSData *, id))o)(self, _cmd, req, body, completion) : nil;
-}
-
-static id LPUploadFile(id self, SEL _cmd, NSURLRequest *req, NSURL *file, id completion) {
-    NSNumber *sz = nil;
-    [file getResourceValue:&sz forKey:NSURLFileSizeKey error:nil];
-    LPLog(@"[net] uploadFile %@ %@ bytes", req.URL.path, sz ?: @"?");
-    IMP o = LPOrigIMPFor(self, _cmd);
-    return o ? ((id (*)(id, SEL, NSURLRequest *, NSURL *, id))o)(self, _cmd, req, file, completion) : nil;
+    CMTime t = o ? ((CMTime (*)(id, SEL))o)(self, _cmd) : kCMTimeZero;
+    LPLog(@"[media] app đọc maxRecordedDuration = %.1fs", CMTimeGetSeconds(t));
+    *(CMTime *)ret = t;
 }
 
 #pragma mark - install
 
 void LPInstallMediaHooks(void) {
-    if (gVideoHooksInstalled) return;
-    gVideoHooksInstalled = YES;
+    if (gMediaHooksInstalled) return;
+    gMediaHooksInstalled = YES;
 
-    // Chỉ hook đúng 2 hàm đặt trần quay phim. Không đụng NSURLSession,
-    // AVAsset, NSFileManager hay NSURL — hook nhầm hàm hệ thống gọi hàng
-    // nghìn lần/giây là nguyên nhân làm app chết ngay khi mở.
     Class out = NSClassFromString(@"AVCaptureMovieFileOutput");
-    LPHook(out, @selector(setMaxRecordedDuration:), (IMP)LPMovieMaxDurationSet);
-    LPHook(out, @selector(setMaxRecordedFileSize:), (IMP)LPMovieMaxSizeSet);
+    LPMHook(out, @selector(setMaxRecordedDuration:), (IMP)LPMovieMaxDurationSet);
+    LPMHook(out, @selector(setMaxRecordedFileSize:), (IMP)LPMovieMaxSizeSet);
+    LPMHook(out, @selector(maxRecordedDuration), (IMP)LPMovieMaxDurationGet);
 
-    LPLog(@"[media] cấu hình %.0fs / %.0fMB", LPVideoSeconds(), LPVideoBytes() / 1048576.0);
+    Class exp = NSClassFromString(@"AVAssetExportSession");
+    LPMHook(exp, @selector(setTimeRange:), (IMP)LPExportTimeRangeSet);
+    LPMHook(exp, @selector(setFileLengthLimit:), (IMP)LPExportFileLengthSet);
+
+    Class picker = NSClassFromString(@"UIImagePickerController");
+    LPMHook(picker, @selector(setVideoMaximumDuration:), (IMP)LPPickerMaxDurSet);
+
+    LPLog(@"[media] trần đặt: %.0fs / %.0fMB", LPVideoSeconds(), LPVideoBytes() / 1048576.0);
 }

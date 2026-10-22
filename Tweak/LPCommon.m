@@ -95,6 +95,47 @@ IMP LPOrigIMPFor(id self, SEL sel) {
     return NULL;
 }
 
+#pragma mark - hook an toàn
+
+BOOL LPHookMethod(Class cls, SEL sel, IMP newImp, IMP *origOut) {
+    if (!cls || !sel || !newImp) return NO;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+    IMP orig = method_getImplementation(m);
+    if (orig == newImp) return YES;
+    LPSetOrigIMP(cls, sel, orig);
+    if (origOut) *origOut = orig;
+    method_setImplementation(m, newImp);
+    return YES;
+}
+
+Class LPFindClassWithMethod(NSArray<NSString *> *names, SEL sel) {
+    for (NSString *n in names) {
+        Class c = NSClassFromString(n);
+        if (c && class_getInstanceMethod(c, sel)) return c;
+    }
+    return nil;
+}
+
+void LPWhenClassReady(NSString *className, void (^block)(Class cls)) {
+    if (!className.length || !block) return;
+    Class c = NSClassFromString(className);
+    if (c) { block(c); return; }
+    // Thử lại tối đa 40 lần trong 20s — Swift class của Locket có thể nạp
+    // muộn hơn dylib, nhưng không được chờ vô hạn.
+    __block int tries = 0;
+    __block void (^retry)(void);
+    retry = ^{
+        Class cls = NSClassFromString(className);
+        if (cls) { block(cls); return; }
+        if (++tries > 40) { LPLog(@"[hook] không thấy class %@", className); return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), retry);
+    };
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), retry);
+}
+
 void LPShowAlert(NSString *title, NSString *msg) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *w = nil;

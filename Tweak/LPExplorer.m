@@ -181,7 +181,7 @@ void LPShowHub(UIViewController *host) {
         add(@"🧭 Runtime Explorer", ^{ LPOpenExplorer(vc); });
         add(@"📄 Xem log", ^{ LPShowText(nil, @"Locket+ log", [LPConfig logText]); });
         add(@"⚙️ Sửa config.plist", ^{ LPShowText(nil, @"config.plist", [NSString stringWithContentsOfFile:[LPConfig path:@"config.plist"] encoding:NSUTF8StringEncoding error:nil]); });
-        add(@"♻️ Nạp lại config", ^{ [[LPConfig shared] reload];
+        add(@"♻️ Nạp lại config", ^{ LPReapplyPatches();
             LPShowAlert(@"Locket+", [NSString stringWithFormat:@"Đã nạp lại.\nVideo %.0fs / %.0fMB",
                                      LPVideoSeconds(), LPVideoBytes() / 1048576.0]); });
         [a addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];

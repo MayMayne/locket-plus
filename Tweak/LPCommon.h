@@ -19,7 +19,7 @@
 + (NSString *)logText;
 @end
 
-// Giá trị giới hạn mặc định mà tweak sẽ thay thế ("known limits")
+// Giới hạn video mong muốn (đọc từ config.plist)
 double LPVideoSeconds(void);
 double LPVideoBytes(void);
 
@@ -27,7 +27,10 @@ void LPInstallCrashHandler(void);
 void LPInstallMediaHooks(void);
 void LPInstallFriendTools(void);
 void LPInstallProfileUI(void);
+void LPInstallProfileButton(UIViewController *vc);
 void LPInstallExplorer(void);
+void LPApplyConfiguredPatches(void);
+void LPReapplyPatches(void);
 
 // UI / tiện ích
 void LPShowText(UIViewController *host, NSString *title, NSString *text);
@@ -40,6 +43,14 @@ void LPRunFriendProbe(UIViewController *host);
 // Bảng IMP gốc dùng chung cho mọi hook
 void LPSetOrigIMP(Class cls, SEL sel, IMP imp);
 IMP LPOrigIMPFor(id self, SEL sel);
+
+// Móc an toàn: nếu class/method chưa tồn tại thì KHÔNG làm gì (không crash).
+BOOL LPHookMethod(Class cls, SEL sel, IMP newImp, IMP *origOut);
+// Tìm class đầu tiên trong danh sách có method (dùng cho class Swift đổi tên giữa các bản).
+Class LPFindClassWithMethod(NSArray<NSString *> *names, SEL sel);
+
+// Hook chờ class xuất hiện (Swift class thường chưa có lúc dylib nạp)
+void LPWhenClassReady(NSString *className, void (^block)(Class cls));
 
 @interface LPProfileModel : NSObject
 @property (nonatomic, copy) NSString *displayName;

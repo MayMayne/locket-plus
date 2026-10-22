@@ -1,10 +1,17 @@
 #import "LPCommon.h"
 #import <objc/runtime.h>
 
-@class LPFabHandler;
+//
+// LPEntry — nút nổi L+ và hook màn hình profile.
+//
+// SỬA: hook viewDidAppear trên class Swift phải CHỜ class xuất hiện
+// (LPWhenClassReady). Trước đây gọi objc_getClass ngay trong constructor
+// nên hầu như luôn nil → nút ✨ không bao giờ được gắn.
+//
 
 static UIButton *gFab;
 static BOOL gBooted = NO;
+static BOOL gProfileHooked = NO;
 
 static UIWindow *LPKeyWindow(void) {
     for (UIScene *sc in UIApplication.sharedApplication.connectedScenes) {
@@ -48,20 +55,48 @@ static void LPInstallFab(void) {
 
 @implementation LPFabHandler
 + (instancetype)shared {
-    static LPFabHandler *s; static dispatch_once_t o;
-    dispatch_once(&o, ^{ s = [LPFabHandler new]; });
-    return s;
+    static LPFabHandler *h;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ h = [LPFabHandler new]; });
+    return h;
 }
+
 - (UIViewController *)topVC {
     UIViewController *vc = LPKeyWindow().rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
     return vc;
 }
+
 - (void)show { LPShowHub([self topVC]); }
 - (void)showDiag { LPRunFriendProbe([self topVC]); }
 @end
 
-void LPApplyConfiguredPatches(void);
+#pragma mark - hook profile
+
+static void (*gOrigViewDidAppear)(id, SEL, BOOL);
+
+static void LPProfileViewDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (gOrigViewDidAppear) gOrigViewDidAppear(self, _cmd, animated);
+    @try { LPInstallProfileButton((UIViewController *)self); } @catch (NSException *e) { LPLog(@"[profile] lỗi: %@", e); }
+}
+
+static void LPInstallProfileHook(void) {
+    if (gProfileHooked) return;
+    NSArray *names = @[@"_TtC14JournalFeature27ProfileMenuV2ViewController",
+                       @"_TtC15SettingsFeature31SettingsMenuSheetViewController"];
+    for (NSString *n in names) {
+        LPWhenClassReady(n, ^(Class cls) {
+            if (gProfileHooked) return;
+            SEL sel = @selector(viewDidAppear:);
+            Method m = class_getInstanceMethod(cls, sel);
+            if (!m) return;
+            gOrigViewDidAppear = (void *)method_getImplementation(m);
+            method_setImplementation(m, (IMP)LPProfileViewDidAppear);
+            gProfileHooked = YES;
+            LPLog(@"[profile] hook %@", n);
+        });
+    }
+}
 
 // Chỉ chạy sau khi UIKit đã sống. Mọi lỗi trong từng khối đều bị nuốt để không làm app chết.
 static void LPBoot(void) {
@@ -71,15 +106,14 @@ static void LPBoot(void) {
     @try { LPInstallMediaHooks(); } @catch (NSException *e) { LPLog(@"[boot] media lỗi: %@", e); }
     @try { LPInstallFriendTools(); } @catch (NSException *e) { LPLog(@"[boot] friend lỗi: %@", e); }
     @try { LPApplyConfiguredPatches(); } @catch (NSException *e) { LPLog(@"[boot] patch lỗi: %@", e); }
-    @try { LPInstallProfileUI(); } @catch (NSException *e) { LPLog(@"[boot] profile lỗi: %@", e); }
+    @try { LPInstallProfileHook(); } @catch (NSException *e) { LPLog(@"[boot] profile lỗi: %@", e); }
     @try { LPInstallFab(); } @catch (NSException *e) { LPLog(@"[boot] fab lỗi: %@", e); }
-    LPLog(@"[boot] Locket+ v1.2 sẵn sàng");
+    LPLog(@"[boot] Locket+ v1.3 sẵn sàng");
 }
 
 __attribute__((constructor))
 static void LPInit(void) {
     // TUYỆT ĐỐI không đụng UIKit ở đây: dylib được nạp trước khi UIApplication tồn tại.
-    // Chỉ đăng ký, rồi chờ thông báo "app đã mở xong".
     @autoreleasepool {
         [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationDidFinishLaunchingNotification

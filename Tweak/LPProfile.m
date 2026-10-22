@@ -413,10 +413,9 @@ static BOOL LPIsProfileMenu(id vc) {
     return [cls containsString:@"ProfileMenuV2"] || [cls containsString:@"ProfileMenu"];
 }
 
-static void LPViewDidAppear(id self, SEL _cmd, BOOL animated) {
-    IMP o = LPOrigIMPFor(self, _cmd);
-    if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
-    if (!LPIsProfileMenu(self)) return;
+// Gắn nút ✨ vào màn profile đang hiển thị. LPEntry gọi sau viewDidAppear gốc.
+void LPInstallProfileButton(UIViewController *self) {
+    if (!self || !LPIsProfileMenu(self)) return;
     UIView *host = ((UIViewController *)self).view;
     if (!host || [host viewWithTag:0x4C50504C]) return;   // LPPL
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -475,15 +474,9 @@ void LPOpenProfile(UIViewController *host) {
     });
 }
 
+// Giữ API cũ: gọi được từ bất cứ đâu (hub menu, boot) — luôn an toàn.
 void LPInstallProfileUI(void) {
-    Class cls = NSClassFromString(@"_TtC14JournalFeature27ProfileMenuV2ViewController");
-    if (!cls) { cls = NSClassFromString(@"ProfileMenuV2ViewController"); }
-    if (!cls) { LPLog(@"[ui] KHÔNG tìm thấy ProfileMenuV2ViewController — chỉ dùng menu nổi"); return; }
-    SEL sel = @selector(viewDidAppear:);
-    Method m = class_getInstanceMethod(cls, sel);
-    if (m) {
-        LPSetOrigIMP(cls, sel, method_getImplementation(m));
-        method_setImplementation(m, (IMP)LPViewDidAppear);
-        LPLog(@"[ui] hook %@ viewDidAppear:", NSStringFromClass(cls));
-    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+        LPInstallProfileButton([LPProfilePresenter shared].top);
+    });
 }

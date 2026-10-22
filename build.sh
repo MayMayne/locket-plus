@@ -6,7 +6,6 @@ set -e
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 OUT=${1:-build}
 MIN=${MIN_IOS:-15.0}
-ARC="-fobjc-arc"
 
 mkdir -p "$OUT"
 
@@ -18,6 +17,7 @@ xcrun --sdk iphoneos clang \
   -miphoneos-version-min="$MIN" \
   -dynamiclib -fobjc-arc -fmodules \
   -O2 -fvisibility=default \
+  -Wno-deprecated-declarations \
   -framework Foundation -framework UIKit -framework AVFoundation \
   -framework PhotosUI -framework CoreMedia -framework QuartzCore \
   -install_name @rpath/LocketPlus.dylib \
@@ -26,4 +26,5 @@ xcrun --sdk iphoneos clang \
 
 echo "==> $OUT/LocketPlus.dylib"
 lipo -info "$OUT/LocketPlus.dylib" || true
+codesign -s - -f "$OUT/LocketPlus.dylib" 2>/dev/null || true
 codesign -dv "$OUT/LocketPlus.dylib" 2>&1 | head -3 || true
