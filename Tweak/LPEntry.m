@@ -40,7 +40,7 @@ static void LPInit(void) {
         @try {
             LPInstallCrashHandler();
             LPBootBegin();
-            LPLog(@"[boot] LocketPlus v6.2 nạp");
+            LPLog(@"[boot] LocketPlus v6.3 nạp");
         } @catch (__unused NSException *e) {}
 
         // 3: keychain/app-group — phải xong trước Firebase Auth.
