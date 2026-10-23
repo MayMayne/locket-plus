@@ -88,3 +88,5 @@ void LPInstallMedia(void);
 void LPInstallUpload(void);
 void LPInstallProbe(void);
 void LPInstallDiscover(void);
+void LPInstallRecorder(void);
+void LPRecorderReapply(void);
