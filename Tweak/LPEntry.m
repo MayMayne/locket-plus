@@ -40,7 +40,7 @@ static void LPInit(void) {
         @try {
             LPInstallCrashHandler();
             LPBootBegin();
-            LPLog(@"[boot] LocketPlus v6.3 nạp");
+            LPLog(@"[boot] LocketPlus v6.4 nạp");
         } @catch (__unused NSException *e) {}
 
         // 3: keychain/app-group — phải xong trước Firebase Auth.
@@ -62,6 +62,10 @@ static void LPInit(void) {
 
             // 3c: probe — chỉ ghi log, không sửa gì. Bật bằng probeEnabled.
             @try { LPInstallProbe(); }
+            @catch (__unused NSException *e) {}
+
+            // 3d: dò class thật của Locket — chỉ đọc. Bật bằng discoverEnabled.
+            @try { LPInstallDiscover(); }
             @catch (__unused NSException *e) {}
         } else {
             LPLog(@"[boot] safeMode — bỏ qua sideload fix");

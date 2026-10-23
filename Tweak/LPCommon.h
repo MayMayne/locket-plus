@@ -87,3 +87,4 @@ void LPInstallGold(void);
 void LPInstallMedia(void);
 void LPInstallUpload(void);
 void LPInstallProbe(void);
+void LPInstallDiscover(void);
